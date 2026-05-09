@@ -1,0 +1,23 @@
+image: python:3.11
+
+stages:
+  - install
+  - test
+
+cache:
+  paths:
+    - .cache/pip/
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+install:
+  stage: install
+  script:
+    - pip install -r requirements.txt
+
+test_imports:
+  stage: test
+  script:
+    - pip install -r requirements.txt
+    - python -c "import mga_engine; print('OK')"
