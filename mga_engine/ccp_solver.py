@@ -83,7 +83,7 @@ if __name__ == "__main__":
     from mga_engine.interior_sampling import sample_interior
     from mga_engine.gp_solver import solve_all_gp
 
-    # Solve OP
+    # --- base solve ---
     network = build_network()
     network.optimize(solver_name="highs", include_objective_constant=False,
                      solver_options={"output_flag": False})
@@ -91,21 +91,27 @@ if __name__ == "__main__":
     poi_specs = make_poi_specs(network)
     p_star = evaluate_all(poi_specs, network)
 
-    # Sample vertices and interior
-    network_mga = build_network()
-    poi_specs_mga = make_poi_specs(network_mga)
+    # --- vertices ---
+    network_v = build_network()
+    poi_specs_v = make_poi_specs(network_v)
     P_vertices = sample_vertices(
-        network_mga, poi_specs_mga, opt_cost,
-        epsilon=0.05, n_samples=20, seed=42,
+        network_v, poi_specs_v, opt_cost,
+        epsilon=0.05, n_samples=50, seed=42,
     )
-    alpha = 0.1
-    P_interior = sample_interior(P_vertices, n_samples=100, seed=0, alpha=alpha)
+
+    # --- interior ---
+    P_interior = sample_interior(
+        build_network_fn=build_network,
+        make_poi_specs_fn=make_poi_specs,
+        opt_cost=opt_cost,
+    )
+
     P_all = np.hstack([P_vertices, P_interior])
 
-    # GP phase
-    v, Gamma = solve_all_gp(P_all)
+    # --- GP phase ---
+    v, Gamma, solutions = solve_all_gp(P_all)
 
-    # Test CCP at p_star and at a few sample points
+    # --- CCP tests ---
     print("\n[ccp] Testing CCP at p_star:")
     alpha_star, cost_star = solve_ccp(p_star, P_all, v)
     print(f"  p_star          = {np.round(p_star, 3)}")
@@ -114,11 +120,7 @@ if __name__ == "__main__":
     print(f"  gap             = {cost_star - opt_cost:,.0f}")
     print(f"  nonzero weights = {(alpha_star > 1e-6).sum()}")
 
-
-
     p_target = np.array([1.3, 3.25])
     alpha_target, cost_target = solve_ccp(p_target, P_all, v)
     print(f"\n[ccp] Cost at p={p_target}:")
     print(f"  cost_approx = {cost_target:,.0f} €/yr")
-
-    

@@ -6,6 +6,7 @@ build/
 .venv/
 .env
 output/
+data/
 *.npz
 *.log
 .DS_Store

@@ -8,8 +8,9 @@ For each sample point p^i in P_all, solve:
                   Dx = p^i        (dual: γ^i  — pins PoI values)
 
 Outputs:
-    v     : (n,)    minimum cost achievable at each p^i
-    Gamma : (m, n)  dual variables for the PoI equality constraints
+    v         : (n,)      minimum cost achievable at each p^i
+    Gamma     : (m, n)    dual variables for the PoI equality constraints
+    solutions : list of dicts, one per sample — full time-varying arrays
 """
 
 import logging
@@ -21,18 +22,36 @@ from mga_engine.network import build_network
 from mga_engine.poi import PoiSpec, make_poi_specs
 
 
+def _extract_solution(network) -> dict:
+    """
+    Generically extract all non-empty time-varying solution arrays
+    from a solved PyPSA network.
+
+    Returns a dict like:
+        {"Generator_p": array(n_snapshots, n_generators), "Line_p0": ..., ...}
+    """
+    solution = {}
+    for component in network.components:
+        for attr, df in component.dynamic.items():
+            if not df.empty:
+                key = f"{component.name}_{attr}"
+                solution[key] = df.values.copy()
+    return solution
+
+
 def _solve_single_gp(
     network: pypsa.Network,
     poi_specs: List[PoiSpec],
     p_i: np.ndarray,
-) -> Tuple[float, np.ndarray]:
+) -> Tuple[float, np.ndarray, dict]:
     """
     Solve GP(p^i) for a single sample point.
 
     Returns
     -------
-    v_i     : float           — minimum cost at p^i
-    gamma_i : np.ndarray (m,) — duals for the PoI equality constraints
+    v_i      : float  — minimum cost at p^i
+    gamma_i  : (m,)   — duals for PoI equality constraints
+    solution : dict   — full time-varying solution arrays
     """
     network.optimize.create_model(include_objective_constant=False)
     m = network.model
@@ -45,11 +64,10 @@ def _solve_single_gp(
 
     m.solve(solver_name="highs", output_flag=False)
 
-    status = m.status
-    if status != "ok":
-        raise RuntimeError(
-            f"GP solve failed at p={np.round(p_i, 4)} — status: {status}"
-        )
+    if m.status != "ok":
+        raise RuntimeError(f"GP solve failed at p={np.round(p_i, 4)}")
+
+    network.optimize.assign_solution()
 
     v_i = network.model.solver_model.getObjectiveValue()
 
@@ -58,49 +76,45 @@ def _solve_single_gp(
         for j in range(len(poi_specs))
     ])
 
-    return v_i, gamma_i
+    solution = _extract_solution(network)
+
+    return v_i, gamma_i, solution
 
 
 def solve_all_gp(
     P_all: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, list]:
     """
-    Solve GP(p^i) for all n sample points in P_all.
-
-    Parameters
-    ----------
-    P_all : np.ndarray, shape (m, n)
+    Solve GP(p^i) for all n sample points.
 
     Returns
     -------
-    v     : np.ndarray, shape (n,)
-    Gamma : np.ndarray, shape (m, n)
+    v         : (n,)      minimum cost per sample
+    Gamma     : (m, n)    dual variables per sample
+    solutions : list of dicts, one per sample — full time-varying arrays
     """
-    logging.getLogger("linopy").setLevel(logging.WARNING)
-    logging.getLogger("pypsa").setLevel(logging.WARNING)
-    warnings.filterwarnings("ignore", category=UserWarning, module="linopy")
-
     m_dim, n = P_all.shape
 
     network_gp = build_network()
     poi_specs_gp = make_poi_specs(network_gp)
 
-    v     = np.zeros(n)
-    Gamma = np.zeros((m_dim, n))
+    v         = np.zeros(n)
+    Gamma     = np.zeros((m_dim, n))
+    solutions = []
 
     print(f"[gp] Solving GP for {n} sample points ...")
     for i in range(n):
-        v_i, gamma_i = _solve_single_gp(network_gp, poi_specs_gp, P_all[:, i])
-        v[i]         = v_i
-        Gamma[:, i]  = gamma_i
+        v_i, gamma_i, sol = _solve_single_gp(network_gp, poi_specs_gp, P_all[:, i])
+        v[i]        = v_i
+        Gamma[:, i] = gamma_i
+        solutions.append(sol)
         print(f"  [{i+1}/{n}]  v={v_i:,.0f}  γ={np.round(gamma_i, 3)}")
 
     print(f"[gp] Done. Cost range: {v.min():,.0f} — {v.max():,.0f}")
-    return v, Gamma
+    return v, Gamma, solutions
 
 
 if __name__ == "__main__":
-    import logging, warnings
     logging.getLogger("linopy").setLevel(logging.WARNING)
     logging.getLogger("pypsa").setLevel(logging.WARNING)
     warnings.filterwarnings("ignore", category=UserWarning, module="linopy")
@@ -108,39 +122,43 @@ if __name__ == "__main__":
     from mga_engine.network import build_network
     from mga_engine.poi import make_poi_specs, evaluate_all
     from mga_engine.vertex_sampling import sample_vertices
-    from mga_engine.interior_sampling import sample_interior
+    from mga_engine.interior_sampling import sample_interior, EPSILON_LEVELS, SAMPLES_PER_LEVEL
 
-    # Solve OP
+    # --- base solve ---
     network = build_network()
     network.optimize(solver_name="highs", include_objective_constant=False,
-                 solver_options={"output_flag": False})
+                     solver_options={"output_flag": False})
     opt_cost = network.objective
     poi_specs = make_poi_specs(network)
     p_star = evaluate_all(poi_specs, network)
 
-    # Sample vertices
-    network_mga = build_network()
-    poi_specs_mga = make_poi_specs(network_mga)
+    # --- vertices ---
+    network_v = build_network()
+    poi_specs_v = make_poi_specs(network_v)
     P_vertices = sample_vertices(
-        network_mga, poi_specs_mga, opt_cost,
-        epsilon=0.05, n_samples=20, seed=42,
+        network_v, poi_specs_v, opt_cost,
+        epsilon=0.05, n_samples=50, seed=42,
     )
 
-    # Sample interior
-    alpha = 0.1
-    P_interior = sample_interior(P_vertices, n_samples=100, seed=0, alpha=alpha)
+    # --- interior ---
+    P_interior = sample_interior(
+        build_network_fn=build_network,
+        make_poi_specs_fn=make_poi_specs,
+        opt_cost=opt_cost,
+    )
 
-    # Combine
+    # --- combine ---
     P_all = np.hstack([P_vertices, P_interior])
     print(f"[main] P_all shape: {P_all.shape}  ({P_all.shape[1]} total sample points)")
 
-    # Solve GP for all points
-    v, Gamma = solve_all_gp(P_all)
+    # --- GP phase ---
+    v, Gamma, solutions = solve_all_gp(P_all)
 
-
-    print (P_all[:, :5])  # print first 5 sample points
-    print(f"\n[main] v     shape: {v.shape}")
-    print(f"[main] Gamma shape: {Gamma.shape}")
-    print(f"[main] opt_cost = {opt_cost:,.0f}")
-    print(f"[main] min v   = {v.min():,.0f}  (should be >= opt_cost)")
-    print(f"[main] max v   = {v.max():,.0f}  (should be <= (1+ε)*opt_cost)")
+    # --- sanity checks ---
+    print(f"\n[main] v shape     : {v.shape}")
+    print(f"[main] Gamma shape : {Gamma.shape}")
+    print(f"[main] solutions   : {len(solutions)} dicts")
+    print(f"[main] keys in first solution: {list(solutions[0].keys())}")
+    print(f"[main] opt_cost    : {opt_cost:,.0f}")
+    print(f"[main] min v       : {v.min():,.0f}  (should be >= opt_cost)")
+    print(f"[main] max v       : {v.max():,.0f}  (should be <= (1+ε)*opt_cost)")

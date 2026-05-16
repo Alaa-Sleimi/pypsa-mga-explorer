@@ -55,7 +55,7 @@ def sample_vertices(
     network: pypsa.Network,
     poi_specs: List[PoiSpec],
     opt_cost: float,
-    epsilon: float = 0.01,
+    epsilon: float = 0.05,
     n_samples: int = 10,
     seed: int = 42,
 ) -> np.ndarray:
@@ -109,7 +109,7 @@ if __name__ == "__main__":
     poi_specs_mga = make_poi_specs(network_mga)
     P_vertices = sample_vertices(
         network_mga, poi_specs_mga, opt_cost,
-        epsilon=0.05,
+        epsilon=0,
         n_samples=20,
         seed=42,
     )
