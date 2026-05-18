@@ -49,7 +49,7 @@ def build_network() -> pypsa.Network:
     n.add("Bus", "south", carrier="AC")
     n.add("Bus", "east",  carrier="AC")
 
-    # Lines (small resistance added to avoid zero-r warning)
+    # Lines (small r added to suppress zero-resistance solver warning — no physical meaning)
     n.add("Line", "north-south", bus0="north", bus1="south",
           s_nom=LINE_S_NOM, x=0.01, r=0.001, carrier="AC")
     n.add("Line", "south-east",  bus0="south", bus1="east",
@@ -57,7 +57,8 @@ def build_network() -> pypsa.Network:
 
     # Capacity factors
     hours = np.arange(N_SNAPSHOTS)
-    solar_cf = np.clip(np.sin(np.pi * (hours % 24 - 6) / 12), 0, 1)
+    hour_of_day = hours % 24
+    solar_cf = np.clip(np.sin(np.pi * (hour_of_day - 6) / 12), 0, 1)
     wind_cf  = 0.3 + 0.15 * np.sin(2 * np.pi * hours / 24 + 1.0)
     wind_cf += 0.05 * np.sin(2 * np.pi * hours / (24 * 3))
 
@@ -67,9 +68,7 @@ def build_network() -> pypsa.Network:
             "Generator", name,
             bus=bus,
             carrier="solar",
-            p_nom=0.0,
             p_nom_extendable=True,
-            p_nom_min=0.0,
             capital_cost=SOLAR_CAPEX,
             marginal_cost=SOLAR_MC,
             p_max_pu=solar_cf,
@@ -80,9 +79,7 @@ def build_network() -> pypsa.Network:
         "Generator", "wind_north",
         bus="north",
         carrier="wind",
-        p_nom=0.0,
         p_nom_extendable=True,
-        p_nom_min=0.0,
         capital_cost=WIND_CAPEX,
         marginal_cost=WIND_MC,
         p_max_pu=wind_cf,
@@ -93,9 +90,7 @@ def build_network() -> pypsa.Network:
         "Generator", "gas_south",
         bus="south",
         carrier="gas",
-        p_nom=0.0,
         p_nom_extendable=True,
-        p_nom_min=0.0,
         capital_cost=GAS_CAPEX,
         marginal_cost=GAS_MC,
     )
@@ -109,12 +104,10 @@ def build_network() -> pypsa.Network:
 
 
 if __name__ == "__main__":
-    from mga_engine.poi import make_poi_specs, evaluate_all
-
     network = build_network()
     status, _ = network.optimize(
         solver_name="highs",
-        include_objective_constant=False,
+        include_objective_constant=False,  # keeps objective as pure total system cost
     )
 
     print(f"Status       : {status}")
@@ -122,10 +115,3 @@ if __name__ == "__main__":
     print()
     print("Optimal capacities [MW]:")
     print(network.generators[["carrier", "p_nom_opt"]])
-    print()
-
-    specs = make_poi_specs(network)        
-    p_star = evaluate_all(specs, network)
-    print("PoI vector p* at optimal solution:")
-    for spec, val in zip(specs, p_star):
-        print(f"  {spec.name:<20s}  {val:.4f}")

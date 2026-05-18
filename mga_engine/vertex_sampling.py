@@ -46,8 +46,13 @@ def _solve_mp(
     m.objective = new_obj
 
     network.model.solve(solver_name="highs", output_flag=False)
-    network.optimize.assign_solution()
 
+    if network.model.status != "ok":
+        raise RuntimeError(
+            f"[vertex] MP(r) solve failed with status: {network.model.status}"
+        )
+
+    network.optimize.assign_solution()
     return evaluate_all(poi_specs, network)
 
 
@@ -89,53 +94,31 @@ if __name__ == "__main__":
     import logging, warnings
     logging.getLogger("linopy").setLevel(logging.WARNING)
     logging.getLogger("pypsa").setLevel(logging.WARNING)
-    warnings.filterwarnings("ignore", category=UserWarning, module="linopy")
+    warnings.filterwarnings("ignore", message=".*experimental.*", category=UserWarning, module="linopy")
 
-    import matplotlib.pyplot as plt
-    from scipy.spatial import ConvexHull
     from mga_engine.network import build_network
     from mga_engine.poi import make_poi_specs, evaluate_all
 
+    # --- Baseline solve ---
     network = build_network()
-    status, _ = network.optimize(
+    _, _ = network.optimize(
         solver_name="highs",
         include_objective_constant=False,
     )
     opt_cost = network.objective
     poi_specs = make_poi_specs(network)
     p_star = evaluate_all(poi_specs, network)
+    print(f"Optimal cost : {opt_cost:,.0f} €/yr")
+    print(f"p*           : {np.round(p_star, 3)}")
 
+    # --- Vertex sampling (epsilon=0 here to verify all points land on boundary) ---
     network_mga = build_network()
-    poi_specs_mga = make_poi_specs(network_mga)
     P_vertices = sample_vertices(
-        network_mga, poi_specs_mga, opt_cost,
+        network_mga, poi_specs, opt_cost,
         epsilon=0,
         n_samples=20,
         seed=42,
     )
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    points = P_vertices.T
-    hull = ConvexHull(points)
-
-    ax.scatter(points[:, 0], points[:, 1],
-               color="steelblue", s=80, zorder=3, label="vertices")
-    ax.scatter(p_star[0], p_star[1],
-               color="red", s=150, marker="*", zorder=4, label="optimal x*")
-
-    for simplex in hull.simplices:
-        ax.plot(points[simplex, 0], points[simplex, 1],
-                "k-", linewidth=1.2, alpha=0.6)
-
-    for idx, (x, y) in enumerate(points):
-        ax.annotate(str(idx), (x, y),
-                    textcoords="offset points", xytext=(5, 5), fontsize=8)
-
-    ax.set_xlabel("solar_cap_gw")
-    ax.set_ylabel("wind_cap_gw")
-    ax.set_title("Near-optimal feasible space F^P (ε=5%)\n2 PoIs — all vertices should be on boundary")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("feasible_space_2poi.png", dpi=150)
-    plt.show()
+    print("\nSampled vertices (columns of P_vertices):")
+    print(np.round(P_vertices, 3))

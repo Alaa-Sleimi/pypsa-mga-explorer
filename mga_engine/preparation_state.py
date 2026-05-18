@@ -1,79 +1,86 @@
 """
 preparation_state.py — Save and load the full preparation phase output.
 
-Saves everything needed for the exploration phase into a single .npz file:
-    - P_all   : (m, n)     all sample points
-    - v       : (n,)       minimum cost at each sample point
-    - Gamma   : (m, n)     dual variables at each sample point
-    - solutions: list of dicts  full time-varying arrays per sample
+Saves everything needed for the exploration phase into a single .nc file
+using xarray. The file contains:
+    - P_all   : (poi, sample)            all sample points
+    - v       : (sample,)                minimum cost at each sample point
+    - Gamma   : (poi, sample)            dual variables at each sample point
+    - solution variables stacked across samples:
+        static  e.g. Generator_p_nom_opt : (sample, Generator_p_nom_opt_idx)
+        dynamic e.g. Generator_p         : (sample, Generator_p_snapshot, Generator_p_idx)
 
 Usage:
-    save("data/preparation_state.npz", P_all, v, Gamma, solutions)
-    state = load("data/preparation_state.npz")
+    save("data/preparation_state.nc", P_all, v, Gamma, solutions)
+    state = load("data/preparation_state.nc")
     state["P_all"], state["v"], state["Gamma"], state["solutions"]
 """
 
 import os
 import numpy as np
+import xarray as xr
 
 
 def save(path: str, P_all, v, Gamma, solutions):
     """
-    Save preparation phase output to a .npz file.
+    Save preparation phase output to a single .nc file.
 
     Parameters
     ----------
-    path      : file path, e.g. "data/preparation_state.npz"
+    path      : file path, e.g. "data/preparation_state.nc"
     P_all     : np.ndarray (m, n)
     v         : np.ndarray (n,)
     Gamma     : np.ndarray (m, n)
-    solutions : list of dicts — one dict per sample, each dict maps
-                key (str) -> np.ndarray of time-varying values
+    solutions : list of dicts — one dict per sample
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
 
-    # Flatten solutions list into individual arrays with prefixed keys
-    # e.g. solutions[3]["Generator_p"] -> "sol_3_Generator_p"
-    flat = {}
-    for i, sol in enumerate(solutions):
-        for key, arr in sol.items():
-            flat[f"sol_{i}_{key}"] = arr
+    n_samples = len(solutions)
 
-    np.savez(
-        path,
-        P_all=P_all,
-        v=v,
-        Gamma=Gamma,
-        n_samples=np.array(len(solutions)),
-        **flat,
-    )
-    print(f"[state] Saved preparation state to {path}  ({len(solutions)} samples)")
+    # --- core arrays ---
+    ds = xr.Dataset({
+        "P_all": xr.DataArray(P_all, dims=["poi", "sample"]),
+        "v":     xr.DataArray(v,     dims=["sample"]),
+        "Gamma": xr.DataArray(Gamma, dims=["poi", "sample"]),
+    })
+
+    # --- solution arrays stacked across samples ---
+    for key in solutions[0].keys():
+        arr = np.stack([sol[key] for sol in solutions], axis=0)
+        if arr.ndim == 2:   # static: (n_samples, n_components)
+            dims = ["sample", f"{key}_idx"]
+        elif arr.ndim == 3: # dynamic: (n_samples, n_snapshots, n_components)
+            dims = ["sample", f"{key}_snapshot", f"{key}_idx"]
+        else:
+            dims = ["sample"] + [f"{key}_dim{k}" for k in range(arr.ndim - 1)]
+        ds[key] = xr.DataArray(arr, dims=dims)
+
+    ds.to_netcdf(path, mode="w")
+    ds.close()
+    print(f"[state] Saved preparation state to {path}  ({n_samples} samples)")
 
 
 def load(path: str) -> dict:
     """
-    Load preparation phase output from a .npz file.
+    Load preparation phase output from a .nc file.
 
     Returns
     -------
     dict with keys: P_all, v, Gamma, solutions
     """
-    data = np.load(path, allow_pickle=False)
+    with xr.open_dataset(path) as ds:
+        P_all = ds["P_all"].values
+        v     = ds["v"].values
+        Gamma = ds["Gamma"].values
+        n     = len(ds["sample"])
 
-    P_all = data["P_all"]
-    v     = data["v"]
-    Gamma = data["Gamma"]
-    n     = int(data["n_samples"])
-
-    # Reconstruct solutions list from flattened keys
-    solutions = []
-    for i in range(n):
-        sol = {}
-        prefix = f"sol_{i}_"
-        for key in data.files:
-            if key.startswith(prefix):
-                sol[key[len(prefix):]] = data[key]
-        solutions.append(sol)
+        solution_keys = [k for k in ds.data_vars if k not in ("P_all", "v", "Gamma")]
+        solutions = []
+        for i in range(n):
+            sol = {key: ds[key].values[i] for key in solution_keys}
+            solutions.append(sol)
 
     print(f"[state] Loaded preparation state from {path}  ({n} samples)")
     return {"P_all": P_all, "v": v, "Gamma": Gamma, "solutions": solutions}
@@ -103,7 +110,7 @@ if __name__ == "__main__":
     poi_specs_v = make_poi_specs(network_v)
     P_vertices = sample_vertices(
         network_v, poi_specs_v, opt_cost,
-        epsilon=0.05, n_samples=50, seed=42,
+        epsilon=0.05, n_samples=30, seed=42,
     )
 
     # --- interior ---
@@ -119,13 +126,13 @@ if __name__ == "__main__":
     v, Gamma, solutions = solve_all_gp(P_all)
 
     # --- save ---
-    save("data/preparation_state.npz", P_all, v, Gamma, solutions)
+    save("data/preparation_state.nc", P_all, v, Gamma, solutions)
 
     # --- reload and verify ---
-    state = load("data/preparation_state.npz")
-    assert np.allclose(state["P_all"], P_all), "P_all mismatch!"
-    assert np.allclose(state["v"], v),         "v mismatch!"
-    assert np.allclose(state["Gamma"], Gamma), "Gamma mismatch!"
-    assert len(state["solutions"]) == len(solutions), "solutions length mismatch!"
+    state = load("data/preparation_state.nc")
+    assert np.allclose(state["P_all"], P_all),            "P_all mismatch!"
+    assert np.allclose(state["v"], v),                    "v mismatch!"
+    assert np.allclose(state["Gamma"], Gamma),            "Gamma mismatch!"
+    assert len(state["solutions"]) == len(solutions),     "solutions length mismatch!"
     print("[state] Verification passed — save/load is consistent.")
     print(f"[state] Keys in first loaded solution: {list(state['solutions'][0].keys())}")

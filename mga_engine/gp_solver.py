@@ -24,18 +24,32 @@ from mga_engine.poi import PoiSpec, make_poi_specs
 
 def _extract_solution(network) -> dict:
     """
-    Generically extract all non-empty time-varying solution arrays
-    from a solved PyPSA network.
-
+    Generically extract decision variables from a solved PyPSA network.
+    
+    - Static (planning): only columns ending in '_opt' e.g. p_nom_opt, s_nom_opt
+    - Dynamic (operational): everything PyPSA populated after solving e.g. Generator_p
+    
     Returns a dict like:
-        {"Generator_p": array(n_snapshots, n_generators), "Line_p0": ..., ...}
+        {"Generator_p_nom_opt": array(n_generators,),
+         "Generator_p": array(n_snapshots, n_generators),
+         "Line_s_nom_opt": array(n_lines,),
+         "Line_p0": array(n_snapshots, n_lines), ...}
     """
     solution = {}
+
     for component in network.components:
+        # --- planning variables: only optimised values ---
+        for attr, series in component.static.items():
+            if attr.endswith("_opt") and series.notna().any():
+                key = f"{component.name}_{attr}"
+                solution[key] = series.values.copy()
+
+        # --- operational variables: all populated dynamic results ---
         for attr, df in component.dynamic.items():
             if not df.empty:
                 key = f"{component.name}_{attr}"
                 solution[key] = df.values.copy()
+
     return solution
 
 
@@ -137,7 +151,7 @@ if __name__ == "__main__":
     poi_specs_v = make_poi_specs(network_v)
     P_vertices = sample_vertices(
         network_v, poi_specs_v, opt_cost,
-        epsilon=0.05, n_samples=50, seed=42,
+        epsilon=0.05, n_samples=20, seed=42,
     )
 
     # --- interior ---

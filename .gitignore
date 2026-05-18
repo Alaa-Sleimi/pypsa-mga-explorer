@@ -8,5 +8,6 @@ build/
 output/
 data/
 *.npz
+*.nc
 *.log
 .DS_Store
