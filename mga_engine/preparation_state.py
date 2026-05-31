@@ -21,7 +21,8 @@ import numpy as np
 import xarray as xr
 
 
-def save(path: str, P_all, v, Gamma, solutions):
+
+def save(path: str, P_all, v, Gamma, solutions, p_star):
     """
     Save preparation phase output to a single .nc file.
 
@@ -32,6 +33,7 @@ def save(path: str, P_all, v, Gamma, solutions):
     v         : np.ndarray (n,)
     Gamma     : np.ndarray (m, n)
     solutions : list of dicts — one dict per sample
+    p_star    : np.ndarray (m,) optimal dual variables at the optimal point
     """
     dirpath = os.path.dirname(path)
     if dirpath:
@@ -44,6 +46,7 @@ def save(path: str, P_all, v, Gamma, solutions):
         "P_all": xr.DataArray(P_all, dims=["poi", "sample"]),
         "v":     xr.DataArray(v,     dims=["sample"]),
         "Gamma": xr.DataArray(Gamma, dims=["poi", "sample"]),
+        "p_star": xr.DataArray(p_star, dims=["poi"]),
     })
 
     # --- solution arrays stacked across samples ---
@@ -74,17 +77,17 @@ def load(path: str) -> dict:
         P_all = ds["P_all"].values
         v     = ds["v"].values
         Gamma = ds["Gamma"].values
+        p_star = ds["p_star"].values
         n     = len(ds["sample"])
 
-        solution_keys = [k for k in ds.data_vars if k not in ("P_all", "v", "Gamma")]
+        solution_keys = [k for k in ds.data_vars if k not in ("P_all", "v", "Gamma", "p_star")]
         solutions = []
         for i in range(n):
             sol = {key: ds[key].values[i] for key in solution_keys}
             solutions.append(sol)
 
     print(f"[state] Loaded preparation state from {path}  ({n} samples)")
-    return {"P_all": P_all, "v": v, "Gamma": Gamma, "solutions": solutions}
-
+    return {"P_all": P_all, "v": v, "Gamma": Gamma, "solutions": solutions, "p_star": p_star}
 
 if __name__ == "__main__":
     import logging, warnings
@@ -104,11 +107,12 @@ if __name__ == "__main__":
                      solver_options={"output_flag": False})
     opt_cost = network.objective
     poi_specs = make_poi_specs(network)
+    p_star    = evaluate_all(poi_specs, network)
 
     # --- vertices ---
-    network_v = build_network()
+    network_v   = build_network()
     poi_specs_v = make_poi_specs(network_v)
-    P_vertices = sample_vertices(
+    P_vertices  = sample_vertices(
         network_v, poi_specs_v, opt_cost,
         epsilon=0.05, n_samples=30, seed=42,
     )
@@ -126,13 +130,15 @@ if __name__ == "__main__":
     v, Gamma, solutions = solve_all_gp(P_all)
 
     # --- save ---
-    save("data/preparation_state.nc", P_all, v, Gamma, solutions)
+    save("data/preparation_state.nc", P_all, v, Gamma, solutions, p_star)
 
     # --- reload and verify ---
     state = load("data/preparation_state.nc")
-    assert np.allclose(state["P_all"], P_all),            "P_all mismatch!"
-    assert np.allclose(state["v"], v),                    "v mismatch!"
-    assert np.allclose(state["Gamma"], Gamma),            "Gamma mismatch!"
-    assert len(state["solutions"]) == len(solutions),     "solutions length mismatch!"
+    assert np.allclose(state["P_all"], P_all),         "P_all mismatch!"
+    assert np.allclose(state["v"], v),                 "v mismatch!"
+    assert np.allclose(state["Gamma"], Gamma),         "Gamma mismatch!"
+    assert np.allclose(state["p_star"], p_star),       "p_star mismatch!"
+    assert len(state["solutions"]) == len(solutions),  "solutions length mismatch!"
     print("[state] Verification passed — save/load is consistent.")
+    print(f"[state] p_star = {p_star}")
     print(f"[state] Keys in first loaded solution: {list(state['solutions'][0].keys())}")

@@ -13,11 +13,13 @@ variables:
 
 install:
   stage: install
+  timeout: 20 minutes
   script:
     - pip install -r requirements.txt
 
 test_imports:
   stage: test
+  timeout: 20 minutes
   script:
     - pip install -r requirements.txt
     - python -c "import mga_engine; print('OK')"
