@@ -97,9 +97,20 @@ def _solve_single_gp(
 
 def solve_all_gp(
     P_all: np.ndarray,
+    build_network_fn=None,
+    make_poi_specs_fn=None,
 ) -> Tuple[np.ndarray, np.ndarray, list]:
     """
     Solve GP(p^i) for all n sample points.
+
+    Parameters
+    ----------
+    P_all             : (m, n) sample matrix
+    build_network_fn  : callable returning a fresh network. Defaults to the
+                        example build_network, so existing callers are unchanged;
+                        pass your own to run GP on a different network.
+    make_poi_specs_fn : callable taking a network -> list[PoiSpec]. Defaults to
+                        make_poi_specs with the default PoI definitions.
 
     Returns
     -------
@@ -107,10 +118,15 @@ def solve_all_gp(
     Gamma     : (m, n)    dual variables per sample
     solutions : list of dicts, one per sample — full time-varying arrays
     """
+    if build_network_fn is None:
+        build_network_fn = build_network
+    if make_poi_specs_fn is None:
+        make_poi_specs_fn = make_poi_specs
+
     m_dim, n = P_all.shape
 
-    network_gp = build_network()
-    poi_specs_gp = make_poi_specs(network_gp)
+    network_gp = build_network_fn()
+    poi_specs_gp = make_poi_specs_fn(network_gp)
 
     v         = np.zeros(n)
     Gamma     = np.zeros((m_dim, n))

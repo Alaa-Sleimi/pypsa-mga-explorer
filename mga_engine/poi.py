@@ -6,12 +6,16 @@ Each PoiSpec bundles two representations of the same quantity:
   - linopy_expr(model) : return a Linopy LinearExpression of the same
                          quantity, for use as an objective or constraint
 
-Both representations are defined together in make_poi_specs().
-No name-matching logic is needed anywhere outside this file.
+The technical part (turning a PoI into those two representations, which needs
+PyPSA's internal variable names) lives in builder functions here. Which PoIs
+actually exist is data-driven: a declarative list of definitions — see
+POI_DEFINITIONS — is turned into PoiSpecs by make_poi_specs(). Callers (and the
+notebook) only pass that declarative list; no name-matching logic is needed
+outside this file.
 """
 
 from dataclasses import dataclass
-from typing import Callable, List
+from typing import Callable, List, Optional
 import numpy as np
 import pypsa
 import linopy
@@ -23,39 +27,64 @@ MW_TO_GW = 1e3
 @dataclass
 class PoiSpec:
     name: str
+    unit: str
     evaluate: Callable[[pypsa.Network], float]
     linopy_expr: Callable[["linopy.Model"], "linopy.LinearExpression"]
 
 
-def make_poi_specs(network: pypsa.Network) -> List[PoiSpec]:
-    # Only generator carrier names are needed here — network does not need to be solved yet
-    solar_gens = network.generators.index[
-        network.generators.carrier == "solar"
-    ].tolist()
+def capacity_poi(
+    network: pypsa.Network,
+    carrier: str,
+    name: Optional[str] = None,
+    unit: str = "GW",
+) -> PoiSpec:
+    """Build a PoiSpec for the total installed capacity of all generators of one carrier.
 
-    wind_gens = network.generators.index[
-        network.generators.carrier == "wind"
-    ].tolist()
+    Both representations sum the generators' nominal power and convert MW -> GW:
+      - evaluate(net) : sum of p_nom_opt   (from a solved network)
+      - linopy_expr(m): sum of Generator-p_nom   (the optimisation variable)
 
-    assert len(solar_gens) > 0, "No solar generators found — check carrier names in network"
-    assert len(wind_gens)  > 0, "No wind generators found — check carrier names in network"
+    The value is always in GW; `unit` is the display label and should stay "GW".
+    The network need not be solved — only carrier membership is read here.
+    """
+    gens = network.generators.index[network.generators.carrier == carrier].tolist()
+    assert len(gens) > 0, f"No generators with carrier {carrier!r} found — check the network"
 
-    def solar_cap_eval(net):
-        return float(net.generators.loc[solar_gens, "p_nom_opt"].sum()) / MW_TO_GW
+    if name is None:
+        name = f"{carrier}_cap_gw"
 
-    def wind_cap_eval(net):
-        return float(net.generators.loc[wind_gens, "p_nom_opt"].sum()) / MW_TO_GW
+    def _eval(net):
+        return float(net.generators.loc[gens, "p_nom_opt"].sum()) / MW_TO_GW
 
-    def solar_cap_expr(m):
-        return m.variables["Generator-p_nom"].sel(name=solar_gens).sum() / MW_TO_GW
+    def _expr(m):
+        return m.variables["Generator-p_nom"].sel(name=gens).sum() / MW_TO_GW
 
-    def wind_cap_expr(m):
-        return m.variables["Generator-p_nom"].sel(name=wind_gens).sum() / MW_TO_GW
+    return PoiSpec(name, unit, _eval, _expr)
 
-    return [
-        PoiSpec("solar_cap_gw", solar_cap_eval, solar_cap_expr),
-        PoiSpec("wind_cap_gw",  wind_cap_eval,  wind_cap_expr),
-    ]
+
+# Declarative default: which PoIs this project explores. Each entry is passed as
+# keyword arguments to capacity_poi(). Edit this list (or pass your own to
+# make_poi_specs) to change the PoIs — but the set/order must match whatever the
+# preparation phase was run with, since P_all's rows are these PoIs in order.
+POI_DEFINITIONS = [
+    {"carrier": "solar", "name": "solar_cap_gw", "unit": "GW"},
+    {"carrier": "wind",  "name": "wind_cap_gw",  "unit": "GW"},
+]
+
+
+def make_poi_specs(
+    network: pypsa.Network,
+    definitions: Optional[List[dict]] = None,
+) -> List[PoiSpec]:
+    """Build the list of PoiSpecs from a declarative list of definitions.
+
+    Each definition is a dict of keyword arguments for capacity_poi
+    (e.g. {"carrier": "solar", "name": "solar_cap_gw", "unit": "GW"}).
+    Defaults to POI_DEFINITIONS when none is given.
+    """
+    if definitions is None:
+        definitions = POI_DEFINITIONS
+    return [capacity_poi(network, **d) for d in definitions]
 
 
 def evaluate_all(specs: List[PoiSpec], network: pypsa.Network) -> np.ndarray:
@@ -77,4 +106,4 @@ if __name__ == "__main__":
 
     print("PoI vector p* at optimal solution:")
     for spec, val in zip(specs, p_star):
-        print(f"  {spec.name:<20s}  {val:.4f} GW")
+        print(f"  {spec.name:<20s}  {val:.4f} {spec.unit}")
