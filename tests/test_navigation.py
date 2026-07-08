@@ -161,7 +161,7 @@ def plot_scenario_a(p_s, p_t, delta_in):
 # SE_a    = set()
 # delta_a = np.array([0.0, 0.3, 0.3])
 
-# alpha_t_a, SG_ao, SL_ao, SE_ao, delta_ao = navigate(
+# alpha_t_a, SG_ao, SL_ao, SE_ao, delta_ao, _ = navigate(
 #     P_all, v, alpha_s, tau_a, SG_a, SL_a, SE_a, delta_a)
 # p_t_a    = P_all @ alpha_t_a
 # cost_t_a = float(alpha_t_a @ v)
@@ -184,7 +184,7 @@ def plot_scenario_a(p_s, p_t, delta_in):
 # SE_b    = set()
 # delta_b = np.array([0.0, 3.0, 0.3])
 
-# alpha_t_b, SG_bo, SL_bo, SE_bo, delta_bo = navigate(
+# alpha_t_b, SG_bo, SL_bo, SE_bo, delta_bo, _ = navigate(
 #     P_all, v, alpha_s, tau_b, SG_b, SL_b, SE_b, delta_b)
 # p_t_b    = P_all @ alpha_t_b
 # cost_t_b = float(alpha_t_b @ v)
@@ -205,8 +205,10 @@ SL_c    = {2}
 SE_c    = set()
 delta_c = np.array([0.0, 0.3, 5.0])
 
-alpha_t_c, SG_co, SL_co, SE_co, delta_co = navigate(
+alpha_t_c, SG_co, SL_co, SE_co, delta_co, loop1_bounds_c = navigate(
     P_all, v, alpha_s, tau_c, SG_c, SL_c, SE_c, delta_c)
+# loop-1 bounds cover exactly the APoIs that ended up in a direction set
+assert {b[0] for b in loop1_bounds_c} == (SG_co | SL_co | SE_co)
 p_t_c    = P_all @ alpha_t_c
 cost_t_c = float(alpha_t_c @ v)
 

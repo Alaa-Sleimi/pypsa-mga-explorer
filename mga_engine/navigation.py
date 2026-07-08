@@ -25,6 +25,9 @@ Outputs:
     SL_out  : set[int]
     SE_out  : set[int]
     delta_out : np.ndarray               — updated magnitudes (feedback)
+    loop1_bounds : list[tuple]           — per-APoI interval bounds fixed by the
+                   first (feasibility) loop, as (apoi_index, lower, upper) with
+                   None where unbounded; APoIs in no direction set get no entry
 """
 
 import numpy as np
@@ -41,7 +44,7 @@ def navigate(
     SL: set,
     SE: set,
     delta: np.ndarray,
-) -> Tuple[np.ndarray, set, set, set, np.ndarray]:
+) -> Tuple[np.ndarray, set, set, set, np.ndarray, list]:
 
     m, n = P_all.shape
 
@@ -142,6 +145,18 @@ def navigate(
         elif i in SG:
             add_ineq(-row_i, -(ps_i + delta[i])) # -P_tilde[i] alpha <= -(ps_i + delta)
 
+    # --- Snapshot loop-1 bounds: the per-APoI intervals AddConst fixed above,
+    # in (apoi_index, lower, upper) form with None where unbounded
+    loop1_bounds = []
+    for i in tau:
+        ps_i = float(p_tilde_s[i])
+        if i in SE:
+            loop1_bounds.append((i, ps_i - float(delta[i]), ps_i + float(delta[i])))
+        elif i in SL:
+            loop1_bounds.append((i, None, ps_i - float(delta[i])))
+        elif i in SG:
+            loop1_bounds.append((i, ps_i + float(delta[i]), None))
+
      # --- Loop 2: Improvement — push each priority as far as possible
     for i in tau:
         row_i = P_tilde[i]
@@ -170,6 +185,6 @@ def navigate(
     # --- Final solve: minimise cost subject to all accumulated constraints
     alpha_t = solve_ncp(v)
 
-    return alpha_t, SG, SL, SE, delta
+    return alpha_t, SG, SL, SE, delta, loop1_bounds
 
 

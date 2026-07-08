@@ -36,7 +36,7 @@ SL    = {2}
 SE    = set()
 delta = np.array([0.0, 0.3, 0.3])
 
-alpha_t, _, _, _, _ = navigate(P_all, v, alpha_s, tau, SG, SL, SE, delta)
+alpha_t, _, _, _, _, _ = navigate(P_all, v, alpha_s, tau, SG, SL, SE, delta)
 p_t    = P_all @ alpha_t
 cost_t = float(alpha_t @ v)
 
