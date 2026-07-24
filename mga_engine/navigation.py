@@ -96,6 +96,35 @@ def navigate(
         A_ub_rows.append(row)
         b_ub_rows.append(rhs)
 
+    def solve_ncp_absdev(row, ref):
+        """Solve NCP with objective min |row @ alpha - ref| (paper Algorithm 1,
+        SE case), linearized with one auxiliary variable t >= 0 and
+        t >= row @ alpha - ref, t >= ref - row @ alpha.
+        Returns (alpha, achieved deviation t)."""
+        n_rows = len(A_ub_rows)
+        A_ub_alpha = np.array(A_ub_rows).reshape(n_rows, n)
+        A_ub = np.vstack([
+            np.hstack([A_ub_alpha, np.zeros((n_rows, 1))]),
+            np.append(row, -1.0),    #  row @ alpha - t <= ref
+            np.append(-row, -1.0),   # -row @ alpha - t <= -ref
+        ])
+        b_ub = np.array([*b_ub_rows, ref, -ref])
+        A_eq = np.hstack([A_eq_base, np.zeros((1, 1))])
+        c = np.zeros(n + 1)
+        c[-1] = 1.0
+        result = linprog(
+            c=c,
+            A_ub=A_ub,
+            b_ub=b_ub,
+            A_eq=A_eq,
+            b_eq=b_eq_base,
+            bounds=[(0.0, None)] * (n + 1),
+            method="highs",
+        )
+        if result.status != 0:
+            raise RuntimeError(f"NCP solve failed: {result.message}")
+        return result.x[:n], float(result.x[n])
+
     # --- Loop 1: Feasibility check and delta/direction update
     for i in tau:
         row_i = P_tilde[i]          # shape (n,), the i-th APoI row
@@ -103,13 +132,7 @@ def navigate(
 
         if i in SE:
             # Minimize |P_tilde[i] @ alpha - ps_i|
-            
-            alpha_lo = solve_ncp(row_i)           # minimise i-th APoI
-            alpha_hi = solve_ncp(-row_i)          # maximise i-th APoI
-            dev = max(
-                abs((P_tilde[i] @ alpha_lo) - ps_i),
-                abs((P_tilde[i] @ alpha_hi) - ps_i),
-            )
+            _, dev = solve_ncp_absdev(row_i, ps_i)
             delta[i] = max(dev, delta[i])
 
         elif i in SL:
@@ -164,7 +187,7 @@ def navigate(
 
         try:
             if i in SE:
-                alpha_star = solve_ncp(row_i)      # minimise value (proxy for staying close)
+                alpha_star, _ = solve_ncp_absdev(row_i, ps_i)  # minimise |value - ps_i|
             elif i in SL:
                 alpha_star = solve_ncp(row_i)      # minimise value = maximise decrease
             elif i in SG:

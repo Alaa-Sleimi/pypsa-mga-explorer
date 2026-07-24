@@ -12,6 +12,8 @@ The file contains:
     - Gamma   : (poi, sample)            dual variables at each sample point
     - p_star  : (poi,)                   PoI vector at the optimal solution
     - epsilon : scalar                   near-optimality threshold used in preparation
+    - n_vertices, n_interior_levels, n_samples_per_level, epsilon_min :
+                                         sampling parameters used (global attributes)
     - poi_names : list[str]              PoI name per row of P_all, in order
     - solution variables stacked across samples:
         static  e.g. Generator_p_nom_opt : (sample, <key>__dim0)
@@ -320,7 +322,8 @@ def _safe_remove(path: str):
 
 
 def save(path: str, P_all, v, Gamma, solutions, p_star, epsilon, poi_names,
-         fingerprint=None):
+         fingerprint=None, n_vertices=None, n_interior_levels=None,
+         n_samples_per_level=None, epsilon_min=None):
     """
     Save preparation phase output to a single .nc file using netCDF4 directly.
 
@@ -337,6 +340,10 @@ def save(path: str, P_all, v, Gamma, solutions, p_star, epsilon, poi_names,
     fingerprint : optional network fingerprint bundle from make_fingerprint()
                   (or a bare hash string). When given, it is stored as global
                   attributes; omitting it keeps existing callers unchanged.
+    n_vertices, n_interior_levels, n_samples_per_level, epsilon_min :
+                  optional sampling parameters the preparation was run with.
+                  Each one given is stored as a global attribute so load()
+                  can hand it back for checking; omitted ones are not stored.
 
     The write is atomic: the file is built as ``path + ".tmp"`` and only
     ``os.replace``-d into place after a clean close, so an interrupted save can
@@ -366,6 +373,14 @@ def save(path: str, P_all, v, Gamma, solutions, p_star, epsilon, poi_names,
 
         # --- scalar / small metadata (global attributes) ---
         ds.epsilon = float(epsilon)
+        if n_vertices is not None:
+            ds.n_vertices = int(n_vertices)
+        if n_interior_levels is not None:
+            ds.n_interior_levels = int(n_interior_levels)
+        if n_samples_per_level is not None:
+            ds.n_samples_per_level = int(n_samples_per_level)
+        if epsilon_min is not None:
+            ds.epsilon_min = float(epsilon_min)
         # newline-joined so it round-trips as a single string attribute
         ds.poi_names = "\n".join(poi_names)
         if fingerprint is not None:
@@ -409,8 +424,9 @@ def load(path: str) -> dict:
 
     Returns
     -------
-    dict with keys: P_all, v, Gamma, p_star, epsilon, poi_names, solutions,
-    fingerprint, fingerprint_version, fingerprint_summary
+    dict with keys: P_all, v, Gamma, p_star, epsilon, n_vertices,
+    n_interior_levels, n_samples_per_level, epsilon_min, poi_names,
+    solutions, fingerprint, fingerprint_version, fingerprint_summary
 
     Notes
     -----
@@ -428,6 +444,15 @@ def load(path: str) -> dict:
 
         epsilon   = float(ds.epsilon) if hasattr(ds, "epsilon") else None
         poi_names = ds.poi_names.split("\n") if hasattr(ds, "poi_names") else None
+
+        # Sampling parameters (absent in files saved before they were added,
+        # including files from the short-lived n_samples attribute era).
+        n_vertices = int(ds.n_vertices) if hasattr(ds, "n_vertices") else None
+        n_interior_levels = (int(ds.n_interior_levels)
+                             if hasattr(ds, "n_interior_levels") else None)
+        n_samples_per_level = (int(ds.n_samples_per_level)
+                               if hasattr(ds, "n_samples_per_level") else None)
+        epsilon_min = float(ds.epsilon_min) if hasattr(ds, "epsilon_min") else None
 
         fingerprint = str(ds.fingerprint) if hasattr(ds, "fingerprint") else None
         fingerprint_version = (int(ds.fingerprint_version)
@@ -458,6 +483,10 @@ def load(path: str) -> dict:
         "Gamma": Gamma,
         "p_star": p_star,
         "epsilon": epsilon,
+        "n_vertices": n_vertices,
+        "n_interior_levels": n_interior_levels,
+        "n_samples_per_level": n_samples_per_level,
+        "epsilon_min": epsilon_min,
         "poi_names": poi_names,
         "fingerprint": fingerprint,
         "fingerprint_version": fingerprint_version,
@@ -472,6 +501,9 @@ def run_preparation(
     epsilon: float = 0.05,
     n_vertices: int = 30,
     seed: int = 42,
+    n_interior_levels: int = 5,
+    n_samples_per_level: int = 10,
+    epsilon_min: float = 0.005,
 ):
     """
     Run the full preparation phase on an arbitrary network and return everything
@@ -489,6 +521,10 @@ def run_preparation(
     epsilon           : near-optimality slack for the outer (vertex) boundary.
     n_vertices        : number of vertex MP(r) samples.
     seed              : RNG seed for vertex sampling.
+    n_interior_levels : number of interior epsilon levels (derived from epsilon
+                        down to epsilon_min via derive_epsilon_levels).
+    n_samples_per_level : interior MP(r) samples per epsilon level.
+    epsilon_min       : smallest interior level; must be > 0 and < epsilon.
 
     Returns
     -------
@@ -496,7 +532,7 @@ def run_preparation(
     """
     from mga_engine.poi import evaluate_all
     from mga_engine.vertex_sampling import sample_vertices
-    from mga_engine.interior_sampling import sample_interior
+    from mga_engine.interior_sampling import sample_interior, derive_epsilon_levels
     from mga_engine.gp_solver import solve_all_gp
 
     # --- base solve: optimal cost and p* ---
@@ -512,8 +548,11 @@ def run_preparation(
     P_vertices = sample_vertices(net_v, make_poi_specs_fn(net_v), opt_cost,
                                  epsilon=epsilon, n_samples=n_vertices, seed=seed)
 
-    # --- interior samples (decreasing epsilon levels) ---
-    P_interior = sample_interior(build_network_fn, make_poi_specs_fn, opt_cost)
+    # --- interior samples (decreasing epsilon levels derived from epsilon) ---
+    epsilon_levels = derive_epsilon_levels(epsilon, n_interior_levels, epsilon_min)
+    P_interior = sample_interior(build_network_fn, make_poi_specs_fn, opt_cost,
+                                 epsilon_levels=epsilon_levels,
+                                 samples_per_level=n_samples_per_level)
 
     P_all = np.hstack([P_vertices, P_interior])
 
@@ -534,10 +573,16 @@ if __name__ == "__main__":
     from mga_engine.poi import make_poi_specs, POI_DEFINITIONS
 
     EPSILON = 0.05
+    N_VERTICES = 30
+    N_INTERIOR_LEVELS = 5
+    N_SAMPLES_PER_LEVEL = 10
+    EPSILON_MIN = 0.005
 
     # Full preparation pipeline on the example network (same call the notebook makes)
     P_all, v, Gamma, solutions, p_star, poi_names = run_preparation(
-        build_network, make_poi_specs, epsilon=EPSILON,
+        build_network, make_poi_specs, epsilon=EPSILON, n_vertices=N_VERTICES,
+        n_interior_levels=N_INTERIOR_LEVELS, n_samples_per_level=N_SAMPLES_PER_LEVEL,
+        epsilon_min=EPSILON_MIN,
     )
 
     # --- fingerprint (cheap, no solve): a fresh unsolved network is enough ---
@@ -545,7 +590,9 @@ if __name__ == "__main__":
 
     # --- save ---
     save("data/preparation_state.nc", P_all, v, Gamma, solutions, p_star, EPSILON,
-         poi_names, fingerprint=fingerprint)
+         poi_names, fingerprint=fingerprint, n_vertices=N_VERTICES,
+         n_interior_levels=N_INTERIOR_LEVELS, n_samples_per_level=N_SAMPLES_PER_LEVEL,
+         epsilon_min=EPSILON_MIN)
 
     # --- reload and verify ---
     state = load("data/preparation_state.nc")

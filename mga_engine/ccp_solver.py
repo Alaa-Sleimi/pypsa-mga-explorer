@@ -59,6 +59,15 @@ def solve_ccp(
         method="highs",
     )
 
+    if result.status == 2:
+        # Infeasible: the equality system Pα = p, α'1 = 1, α ≥ 0 has no
+        # solution, i.e. p lies outside the convex hull of the sample points.
+        raise RuntimeError(
+            f"CCP solve failed at p={np.round(p, 4)} — point lies outside the "
+            f"sampled convex hull. Increase the sampling density "
+            f"(n_vertices / n_samples_per_level) and re-run the preparation. "
+            f"(solver status {result.status}: {result.message})"
+        )
     if result.status != 0:
         raise RuntimeError(
             f"CCP solve failed at p={np.round(p, 4)} — "

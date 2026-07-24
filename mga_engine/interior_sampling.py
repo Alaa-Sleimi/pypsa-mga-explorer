@@ -11,8 +11,29 @@ import numpy as np
 from mga_engine.vertex_sampling import sample_vertices
 
 
-EPSILON_LEVELS = [ 0.04, 0.03, 0.02, 0.01, 0.005]
+# Kept only as documented defaults for sample_interior's signature. The actual
+# levels are derived from user parameters via derive_epsilon_levels(); these
+# equal derive_epsilon_levels(epsilon=0.05, n_levels=5, epsilon_min=0.005).
+EPSILON_LEVELS = [0.04, 0.03, 0.02, 0.01, 0.005]
 SAMPLES_PER_LEVEL = 10
+
+
+def derive_epsilon_levels(epsilon: float, n_levels: int, epsilon_min: float) -> list:
+    """Derive the interior sampling epsilon levels from the outer epsilon.
+
+    Levels descend linearly from epsilon in steps of epsilon / n_levels — the
+    top level is the first step below epsilon (strictly below it) — and the
+    last level is epsilon_min. With epsilon=0.05, n_levels=5, epsilon_min=0.005
+    this reproduces the sequence formerly hardcoded here:
+    [0.04, 0.03, 0.02, 0.01, 0.005].
+    """
+    assert n_levels >= 1, f"n_levels must be >= 1, got {n_levels}"
+    assert 0 < epsilon_min < epsilon, (
+        f"epsilon_min must be > 0 and < epsilon ({epsilon}), got {epsilon_min}")
+    step = epsilon / n_levels
+    # round() strips float artifacts (0.04000000000000001 -> 0.04) so the
+    # levels print cleanly; numerically irrelevant at 12 decimals.
+    return [round(epsilon - k * step, 12) for k in range(1, n_levels)] + [epsilon_min]
 
 
 def sample_interior(
@@ -30,7 +51,8 @@ def sample_interior(
     build_network_fn   : callable that returns a fresh PyPSA network
     make_poi_specs_fn  : callable that takes a network and returns poi_specs
     opt_cost           : c'x* from the base solve
-    epsilon_levels     : list of epsilon values to sweep through
+    epsilon_levels     : list of epsilon values to sweep through (typically
+                         from derive_epsilon_levels)
     samples_per_level  : number of MP(r) solves per epsilon level
 
     Returns
