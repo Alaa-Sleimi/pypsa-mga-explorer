@@ -22,6 +22,9 @@ def _build_mga_model(
     opt_cost: float,
     epsilon: float,
 ) -> None:
+    """Create a fresh Linopy model on `network` (pypsa.Network) and add the MGA
+    cost-slack constraint using `opt_cost` (float) and `epsilon` (float).
+    Returns None; the model is left on network.model."""
     network.optimize.create_model(include_objective_constant=False)
     m = network.model
     mga_rhs = (1.0 + epsilon) * opt_cost
@@ -37,6 +40,9 @@ def _solve_mp(
     poi_specs: List[PoiSpec],
     direction: np.ndarray,
 ) -> np.ndarray:
+    """Solve MP(r) on the prepared model for `direction` (np.ndarray, shape (m,))
+    over `poi_specs` (List[PoiSpec]); returns the PoI vector (np.ndarray, shape
+    (m,)). Raises RuntimeError if the solve status is not "ok"."""
     m = network.model
 
     new_obj = sum(
@@ -54,60 +60,6 @@ def _solve_mp(
 
     network.optimize.assign_solution()
     return evaluate_all(poi_specs, network)
-
-
-def _solve_ray(
-    network: pypsa.Network,
-    poi_specs: List[PoiSpec],
-    l_var,
-    p_start: np.ndarray,
-    direction: np.ndarray,
-):
-    """
-    Shoot one ray from p_start along `direction` and return the boundary point.
-
-    Solves:
-        max  l
-        s.t. poi_i(x) == p_start[i] + l * direction[i]   for every PoI i
-             x ∈ F^M                                       (mga_slack already on model)
-
-    `l_var` is the scalar Linopy variable added once by the caller. The per-direction
-    equality constraints are added here and removed before returning, so they do not
-    accumulate across directions (reused-model pattern).
-
-    Returns
-    -------
-    p : np.ndarray (m,) boundary point, or None if the solve was not "ok".
-    """
-    m = network.model
-    ray_con_names = []
-
-    # poi_i(x) - direction_i * l == p_start_i
-    for i in range(len(poi_specs)):
-        cname = f"ray_eq_{i}"
-        m.add_constraints(
-            poi_specs[i].linopy_expr(m) - float(direction[i]) * l_var
-            == float(p_start[i]),
-            name=cname,
-        )
-        ray_con_names.append(cname)
-
-    # maximize l  ==  minimize -l  (model is default-minimize)
-    m.objective = -l_var
-
-    network.model.solve(solver_name="highs", output_flag=False)
-    status = network.model.status
-
-    p = None
-    if status == "ok":
-        network.optimize.assign_solution()
-        p = evaluate_all(poi_specs, network)
-
-    # remove the per-direction constraints so the next ray starts clean
-    for cname in ray_con_names:
-        m.remove_constraints(cname)
-
-    return status, p
 
 
 def sample_vertices(
@@ -142,90 +94,6 @@ def sample_vertices(
         print(f"  [{k+1}/{n_samples}]  p = {np.round(p, 3)}")
 
     return P_vertices
-
-
-def sample_boundary_rays(
-    network: pypsa.Network,
-    poi_specs: List[PoiSpec],
-    opt_cost: float,
-    p_star: np.ndarray,
-    epsilon: float = 0.05,
-    n_samples: int = 10,
-    seed: int = 42,
-) -> np.ndarray:
-    """
-    Sample boundary points of F^P by ray-shooting from p_start = p*.
-
-    For each random unit direction r we solve, in BOTH the +r and -r senses,
-
-        max  l   s.t.  poi_i(x) == p_start[i] + l * r[i]   for every PoI i,
-                       x ∈ F^M
-
-    Each solve returns one boundary point p_start + l*r. Shooting random rays
-    from a fixed interior start spreads samples over the boundary surface,
-    rather than clustering on the few dominant vertices that random objective
-    directions (MP(r)) tend to return.
-
-    n_samples counts TOTAL points. Since each direction yields two points (+r, -r),
-    we shoot ceil(n_samples / 2) directions. With an odd n_samples this returns
-    one extra point (round up), e.g. n_samples=11 -> 6 directions -> 12 points.
-
-    Directions whose solve is infeasible/unbounded are skipped (logged), so the
-    returned matrix may have fewer columns than 2 * n_directions.
-
-    Parameters
-    ----------
-    network   : PyPSA network (will have a fresh MGA model built on it)
-    poi_specs : list of PoiSpec
-    opt_cost  : optimal total system cost c'x*
-    p_star    : np.ndarray (m,) PoI vector at the optimal point (ray start)
-    epsilon   : near-optimality slack
-    n_samples : total number of boundary points to aim for
-    seed      : RNG seed
-
-    Returns
-    -------
-    P_rays : np.ndarray of shape (m, n_points_collected)
-    """
-    rng = np.random.default_rng(seed)
-    m_dim = len(poi_specs)
-    p_start = np.asarray(p_star, dtype=float)
-
-    n_directions = -(-n_samples // 2)  # ceil division (round up)
-
-    _build_mga_model(network, opt_cost, epsilon)
-
-    # Add the scalar step-length variable ONCE; reused for every ray.
-    l_var = network.model.add_variables(name="ray_l")
-
-    collected = []
-    n_failed = 0
-
-    print(f"[ray] Shooting {n_directions} directions (±r) "
-          f"-> up to {2 * n_directions} points ...")
-    for k in range(n_directions):
-        r = rng.standard_normal(m_dim)
-        r /= np.linalg.norm(r)
-
-        for sign in (+1.0, -1.0):
-            direction = sign * r
-            status, p = _solve_ray(network, poi_specs, l_var, p_start, direction)
-            if status == "ok":
-                collected.append(p)
-                print(f"  [{len(collected)}]  sign={sign:+.0f}  p = {np.round(p, 3)}")
-            else:
-                n_failed += 1
-                print(f"  [skip] direction {k} sign={sign:+.0f} -> status: {status}")
-
-    if n_failed:
-        print(f"[ray] {n_failed} ray solve(s) skipped (infeasible/unbounded).")
-
-    if not collected:
-        raise RuntimeError("[ray] No boundary points collected — all ray solves failed.")
-
-    P_rays = np.column_stack(collected)
-    print(f"[ray] Collected {P_rays.shape[1]} boundary points.")
-    return P_rays
 
 
 if __name__ == "__main__":

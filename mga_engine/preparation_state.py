@@ -364,6 +364,26 @@ def save(path: str, P_all, v, Gamma, solutions, p_star, epsilon, poi_names,
         f"poi_names has {len(poi_names)} entries but P_all has {m_dim} PoI rows"
     )
 
+    # Pre-flight: every solution dict must have the same keys and per-key array
+    # shapes as solutions[0]; otherwise the np.stack below fails inscrutably.
+    ref_keys = set(solutions[0].keys())
+    ref_shapes = {k: np.asarray(solutions[0][k]).shape for k in ref_keys}
+    for s_idx, sol in enumerate(solutions[1:], start=1):
+        if set(sol.keys()) != ref_keys:
+            missing = sorted(ref_keys - set(sol.keys()))
+            extra = sorted(set(sol.keys()) - ref_keys)
+            raise ValueError(
+                f"solutions[{s_idx}] keys differ from solutions[0]: "
+                f"missing={missing}, extra={extra}"
+            )
+        for k in ref_keys:
+            shape = np.asarray(sol[k]).shape
+            if shape != ref_shapes[k]:
+                raise ValueError(
+                    f"solutions[{s_idx}][{k!r}] has shape {shape}, but "
+                    f"solutions[0][{k!r}] has shape {ref_shapes[k]}"
+                )
+
     tmp = path + ".tmp"
     ds = Dataset(tmp, mode="w", format="NETCDF4")
     try:

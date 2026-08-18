@@ -2,9 +2,11 @@
 traverse.py — Traverse Algorithms (Algorithms 2 and 3 from Sina's paper).
 
 Algorithm 2: Interpolation Points Extraction
-    Given alpha_s and alpha_t, finds breakpoints SI along the linear
-    interpolation path in F^P where the cost approximation improves
-    significantly over the simple linear interpolation.
+    Given alpha_s and alpha_t, finds breakpoints SI along the interpolation
+    path, which is linear in the PoI coordinates, where the cost approximation
+    improves significantly over the simple linear interpolation. The cost
+    coordinate of each breakpoint holds the LP-minimized cost, not the
+    linearly interpolated one.
 
 Algorithm 3: Subgradient Generation
     Given SI, generates subgradient functions of phi(p) at the

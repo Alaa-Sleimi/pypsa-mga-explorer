@@ -40,7 +40,7 @@ def sample_interior(
     build_network_fn,
     make_poi_specs_fn,
     opt_cost: float,
-    epsilon_levels: list = EPSILON_LEVELS,
+    epsilon_levels: list | None = None,
     samples_per_level: int = SAMPLES_PER_LEVEL,
 ) -> np.ndarray:
     """
@@ -59,6 +59,9 @@ def sample_interior(
     -------
     P_interior : np.ndarray, shape (m, total_samples)
     """
+    if epsilon_levels is None:
+        epsilon_levels = EPSILON_LEVELS
+
     all_columns = []
 
     for i, eps in enumerate(epsilon_levels):
@@ -108,7 +111,7 @@ if __name__ == "__main__":
         epsilon=0.05, n_samples=50, seed=42,
     )
 
-    # --- interior (6 epsilon levels, fresh network per level) ---
+    # --- interior (5 epsilon levels, fresh network per level) ---
     P_interior = sample_interior(
         build_network_fn=build_network,
         make_poi_specs_fn=make_poi_specs,

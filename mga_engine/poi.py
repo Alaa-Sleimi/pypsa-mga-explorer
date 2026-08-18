@@ -20,12 +20,25 @@ import numpy as np
 import pypsa
 import linopy
 
-# Unit conversion: all PoI values are expressed in GW, not MW
+# Unit conversion: MW per GW — used as a DIVISOR (MW values / MW_TO_GW = GW),
+# so all PoI values are expressed in GW, not MW
 MW_TO_GW = 1e3
 
 
 @dataclass
 class PoiSpec:
+    """Bundles the two representations of one PoI: an `evaluate` callable and a
+    `linopy_expr` callable for the same quantity.
+
+    Attributes
+    ----------
+    name        : str — PoI identifier (row label in P_all)
+    unit        : str — display unit label
+    evaluate    : Callable[[pypsa.Network], float] — value from a solved network
+    linopy_expr : Callable[[linopy.Model], linopy.LinearExpression] — the same
+                  quantity as an optimisation expression
+    """
+
     name: str
     unit: str
     evaluate: Callable[[pypsa.Network], float]

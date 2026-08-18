@@ -83,7 +83,7 @@ def _solve_single_gp(
 
     network.optimize.assign_solution()
 
-    v_i = network.model.solver_model.getObjectiveValue()
+    v_i = float(m.objective.value)
 
     gamma_i = np.array([
         float(m.dual[f"poi_fix_{j}"].values.flat[0])

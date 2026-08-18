@@ -45,7 +45,28 @@ def navigate(
     SE: set,
     delta: np.ndarray,
 ) -> Tuple[np.ndarray, set, set, set, np.ndarray, list]:
+    """Compute target solution weights from current weights and user preferences.
 
+    Parameters
+    ----------
+    P_all   : np.ndarray, shape (m, n)  — PoI sample matrix
+    v       : np.ndarray, shape (n,)    — min cost at each sample
+    alpha_s : np.ndarray, shape (n,)    — current solution weights
+    tau     : list[int]                 — priority order over APoI indices
+    SG      : set[int]                  — APoI indices to increase
+    SL      : set[int]                  — APoI indices to decrease
+    SE      : set[int]                  — APoI indices to keep equal
+    delta   : np.ndarray, shape (m+1,)  — desired magnitude per APoI index
+
+    Returns
+    -------
+    (alpha_t, SG_out, SL_out, SE_out, delta_out, loop1_bounds) :
+        alpha_t      : np.ndarray, shape (n,) — target solution weights
+        SG_out, SL_out, SE_out : set[int]     — updated direction sets (feedback)
+        delta_out    : np.ndarray             — updated magnitudes (feedback)
+        loop1_bounds : list[tuple]            — (apoi_index, lower, upper) per
+                       APoI in a direction set, None where unbounded
+    """
     m, n = P_all.shape
 
     # --- Step 1: Build P_tilde = [v' ; P], shape (m+1, n)

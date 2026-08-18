@@ -78,10 +78,6 @@ cost_lower = [max(g(b) for g in SS) for b in betas]
 
 fig, ax = plt.subplots(figsize=(9, 5))
 
-# --- Plot individual subgradient lines ---
-g_values = np.array([[g(b) for b in betas] for g in SS])  # shape (n_subgrads, n_betas)
-envelope = g_values.max(axis=0)                             # pointwise maximum
-
 # --- Plot individual subgradient lines (only those that contribute to envelope) ---
 g_values = np.array([[g(b) for b in betas] for g in SS])  # shape (n_subgrads, n_betas)
 envelope = g_values.max(axis=0)                             # pointwise maximum

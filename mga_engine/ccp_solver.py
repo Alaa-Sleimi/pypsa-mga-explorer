@@ -1,7 +1,7 @@
 """
 ccp_solver.py — Convex Combination Problem (CCP) solver.
 
-Given a target point p in F^P, solve:
+Given a target point p in the convex hull of the sample points (a subset of F^P), solve:
 
     CCP(p): min  α'v
             s.t. Pα = p       (m equality constraints)
