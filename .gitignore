@@ -11,3 +11,4 @@ data/
 *.nc
 *.log
 .DS_Store
+CODE_REVIEW.md
