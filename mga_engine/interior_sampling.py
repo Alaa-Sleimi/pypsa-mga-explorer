@@ -42,6 +42,7 @@ def sample_interior(
     opt_cost: float,
     epsilon_levels: list | None = None,
     samples_per_level: int = SAMPLES_PER_LEVEL,
+    seed: int = 42,
 ) -> np.ndarray:
     """
     Sample interior points by running MP(r) at decreasing epsilon levels.
@@ -54,6 +55,8 @@ def sample_interior(
     epsilon_levels     : list of epsilon values to sweep through (typically
                          from derive_epsilon_levels)
     samples_per_level  : number of MP(r) solves per epsilon level
+    seed               : caller seed; one independent child seed per epsilon
+                         level is derived from it via SeedSequence.spawn()
 
     Returns
     -------
@@ -61,6 +64,14 @@ def sample_interior(
     """
     if epsilon_levels is None:
         epsilon_levels = EPSILON_LEVELS
+
+    # One independent child seed per epsilon level, derived from the caller's
+    # seed: same seed -> identical samples every run, different seed ->
+    # genuinely different samples at every level.
+    level_seeds = [
+        int(child.generate_state(1)[0])
+        for child in np.random.SeedSequence(seed).spawn(len(epsilon_levels))
+    ]
 
     all_columns = []
 
@@ -75,7 +86,7 @@ def sample_interior(
             opt_cost=opt_cost,
             epsilon=eps,
             n_samples=samples_per_level,
-            seed=i * 100,          # different directions per level
+            seed=level_seeds[i],   # per-level child seed derived from `seed`
         )
         all_columns.append(P_level)
 

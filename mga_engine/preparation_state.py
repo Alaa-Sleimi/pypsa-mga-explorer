@@ -263,18 +263,33 @@ def _summary_diff(old: dict, new: dict) -> list:
     return lines
 
 
-def check_state(state, network, poi_definitions, requested_epsilon):
+def check_state(state, network, poi_definitions, requested_epsilon,
+                requested_n_vertices=None, requested_seed=None,
+                requested_n_samples_per_level=None):
     """Compare a loaded state's fingerprint against the current setup.
+
+    The network/PoI/epsilon fingerprint is always checked. The sampling
+    parameters (n_vertices, seed, n_samples_per_level) are additionally
+    compared against the current run's intended values ONLY when the caller
+    supplies them via the requested_* keyword arguments; each defaults to
+    None, meaning "don't check this one" (preserves prior behavior for
+    callers that omit them). The vertex-phase epsilon is already covered by
+    requested_epsilon via the network fingerprint.
 
     Returns
     -------
     (status, message) where status is one of:
-        "PASS"       — fingerprint matches this network / PoIs / epsilon
-        "MISMATCH"   — a real mismatch; message diffs the summaries
-        "UNVERIFIED" — no/incomparable fingerprint (old file or version bump)
+        "PASS"       — fingerprint matches this network / PoIs / epsilon, and
+                       every requested sampling parameter that could be
+                       compared matches too
+        "MISMATCH"   — a real mismatch (network/PoI/epsilon, or a supplied
+                       sampling parameter); message diffs the summaries
+        "UNVERIFIED" — no/incomparable fingerprint (old file or version
+                       bump), or a requested sampling parameter's stored
+                       attribute is missing (older file predates it)
 
     Pure and cheap — recomputes the current fingerprint (no solver calls) and
-    compares strings.
+    compares strings/values.
     """
     stored = state.get("fingerprint")
     if stored is None:
@@ -290,18 +305,53 @@ def check_state(state, network, poi_definitions, requested_epsilon):
                 f"code's ({FINGERPRINT_VERSION}); cannot compare reliably. Proceeding unverified.")
 
     current = network_fingerprint(network, poi_definitions, requested_epsilon)
-    if current == stored:
-        return ("PASS",
-                "Preparation state matches the current network, PoI definitions, and epsilon.")
+    if current != stored:
+        old_summary = state.get("fingerprint_summary") or {}
+        new_summary = fingerprint_summary(network, poi_definitions, requested_epsilon)
+        message = ("Preparation state does NOT match the current setup:\n"
+                   + "\n".join(_summary_diff(old_summary, new_summary))
+                   + "\n\nThe cached samples were built for a different network / PoIs / epsilon, "
+                     "so loading them would silently corrupt everything downstream. "
+                     "Set rerun_preparation = True and re-run Section 3 to rebuild the state.")
+        return ("MISMATCH", message)
 
-    old_summary = state.get("fingerprint_summary") or {}
-    new_summary = fingerprint_summary(network, poi_definitions, requested_epsilon)
-    message = ("Preparation state does NOT match the current setup:\n"
-               + "\n".join(_summary_diff(old_summary, new_summary))
-               + "\n\nThe cached samples were built for a different network / PoIs / epsilon, "
-                 "so loading them would silently corrupt everything downstream. "
-                 "Set rerun_preparation = True and re-run Section 3 to rebuild the state.")
-    return ("MISMATCH", message)
+    # --- sampling parameters: compared only when the caller supplies a
+    # requested_* value; a stored attribute may be None on an older file ---
+    requested = {
+        "n_vertices": requested_n_vertices,
+        "seed": requested_seed,
+        "n_samples_per_level": requested_n_samples_per_level,
+    }
+    mismatches = []
+    unverifiable = []
+    for key, want in requested.items():
+        if want is None:
+            continue  # caller didn't ask to check this one
+        have = state.get(key)
+        if have is None:
+            unverifiable.append(key)
+        elif have != want:
+            mismatches.append(f"  - {key}: saved={have!r}  →  current={want!r}")
+
+    if mismatches:
+        message = ("Preparation state does NOT match the current sampling parameters:\n"
+                   + "\n".join(mismatches)
+                   + "\n\nThe cached samples were drawn with different sampling parameters, "
+                     "so loading them would silently corrupt everything downstream. "
+                     "Set rerun_preparation = True and re-run Section 3 to rebuild the state.")
+        return ("MISMATCH", message)
+
+    if unverifiable:
+        message = ("Preparation state matches the current network, PoI definitions, and "
+                    "epsilon, but the following sampling-parameter attribute(s) are missing "
+                    f"from this file (older file predates them): {', '.join(unverifiable)}. "
+                    "Cannot verify those against the current sampling parameters. Proceeding "
+                    "unverified for them — if results look wrong, set rerun_preparation = True "
+                    "to rebuild it.")
+        return ("UNVERIFIED", message)
+
+    return ("PASS",
+            "Preparation state matches the current network, PoI definitions, and epsilon.")
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +373,7 @@ def _safe_remove(path: str):
 
 def save(path: str, P_all, v, Gamma, solutions, p_star, epsilon, poi_names,
          fingerprint=None, n_vertices=None, n_interior_levels=None,
-         n_samples_per_level=None, epsilon_min=None):
+         n_samples_per_level=None, epsilon_min=None, seed=None):
     """
     Save preparation phase output to a single .nc file using netCDF4 directly.
 
@@ -340,7 +390,7 @@ def save(path: str, P_all, v, Gamma, solutions, p_star, epsilon, poi_names,
     fingerprint : optional network fingerprint bundle from make_fingerprint()
                   (or a bare hash string). When given, it is stored as global
                   attributes; omitting it keeps existing callers unchanged.
-    n_vertices, n_interior_levels, n_samples_per_level, epsilon_min :
+    n_vertices, n_interior_levels, n_samples_per_level, epsilon_min, seed :
                   optional sampling parameters the preparation was run with.
                   Each one given is stored as a global attribute so load()
                   can hand it back for checking; omitted ones are not stored.
@@ -401,6 +451,8 @@ def save(path: str, P_all, v, Gamma, solutions, p_star, epsilon, poi_names,
             ds.n_samples_per_level = int(n_samples_per_level)
         if epsilon_min is not None:
             ds.epsilon_min = float(epsilon_min)
+        if seed is not None:
+            ds.seed = int(seed)
         # newline-joined so it round-trips as a single string attribute
         ds.poi_names = "\n".join(poi_names)
         if fingerprint is not None:
@@ -445,7 +497,7 @@ def load(path: str) -> dict:
     Returns
     -------
     dict with keys: P_all, v, Gamma, p_star, epsilon, n_vertices,
-    n_interior_levels, n_samples_per_level, epsilon_min, poi_names,
+    n_interior_levels, n_samples_per_level, epsilon_min, seed, poi_names,
     solutions, fingerprint, fingerprint_version, fingerprint_summary
 
     Notes
@@ -473,6 +525,7 @@ def load(path: str) -> dict:
         n_samples_per_level = (int(ds.n_samples_per_level)
                                if hasattr(ds, "n_samples_per_level") else None)
         epsilon_min = float(ds.epsilon_min) if hasattr(ds, "epsilon_min") else None
+        seed = int(ds.seed) if hasattr(ds, "seed") else None
 
         fingerprint = str(ds.fingerprint) if hasattr(ds, "fingerprint") else None
         fingerprint_version = (int(ds.fingerprint_version)
@@ -507,6 +560,7 @@ def load(path: str) -> dict:
         "n_interior_levels": n_interior_levels,
         "n_samples_per_level": n_samples_per_level,
         "epsilon_min": epsilon_min,
+        "seed": seed,
         "poi_names": poi_names,
         "fingerprint": fingerprint,
         "fingerprint_version": fingerprint_version,
@@ -540,7 +594,8 @@ def run_preparation(
                         the same PoIs, in the same order, you intend to explore.
     epsilon           : near-optimality slack for the outer (vertex) boundary.
     n_vertices        : number of vertex MP(r) samples.
-    seed              : RNG seed for vertex sampling.
+    seed              : RNG seed for vertex sampling; per-level interior seeds
+                        are derived from it via SeedSequence.spawn().
     n_interior_levels : number of interior epsilon levels (derived from epsilon
                         down to epsilon_min via derive_epsilon_levels).
     n_samples_per_level : interior MP(r) samples per epsilon level.
@@ -572,7 +627,8 @@ def run_preparation(
     epsilon_levels = derive_epsilon_levels(epsilon, n_interior_levels, epsilon_min)
     P_interior = sample_interior(build_network_fn, make_poi_specs_fn, opt_cost,
                                  epsilon_levels=epsilon_levels,
-                                 samples_per_level=n_samples_per_level)
+                                 samples_per_level=n_samples_per_level,
+                                 seed=seed)
 
     P_all = np.hstack([P_vertices, P_interior])
 

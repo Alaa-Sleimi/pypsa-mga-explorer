@@ -72,6 +72,11 @@ except ImportError:  # pragma: no cover
         _QhullError = Exception  # fallback: catch broadly if unavailable
 
 
+# HiGHS seed for the SP(p) MILP solve — fixed (together with threads=1) so
+# tie-breaking in the MIP search is run-to-run deterministic.
+MILP_RANDOM_SEED = 0
+
+
 # --------------------------------------------------------------------------- #
 # Result container
 # --------------------------------------------------------------------------- #
@@ -243,6 +248,10 @@ def _solve_milp(p_solve: np.ndarray, P: np.ndarray, big_bound: float = 1e3):
 
     h = highspy.Highs()
     h.setOptionValue("output_flag", False)
+    # Deterministic MILP: single thread + fixed seed remove run-to-run
+    # nondeterminism in tie-breaking (which optimal r is returned).
+    h.setOptionValue("threads", 1)
+    h.setOptionValue("random_seed", MILP_RANDOM_SEED)
 
     inf = highspy.kHighsInf
 

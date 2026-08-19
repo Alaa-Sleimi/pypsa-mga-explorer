@@ -34,6 +34,13 @@ import numpy as np
 from scipy.optimize import linprog
 from typing import Tuple
 
+# Absolute lock-in window for improved PoIs (Loop 2).
+# LOAD-BEARING: surrogate.py's tol_interior is sized to absorb this offset
+# (navigation leaves locked boundary points ~1e-6 inside the hull; the
+# surrogate's project-and-retry compensates). Do not change this value
+# without re-validating surrogate.py together.
+LOCK_IN_TOL = 1e-6
+
 
 def navigate(
     P_all: np.ndarray,
@@ -218,8 +225,8 @@ def navigate(
 
             val_t = P_tilde[i] @ alpha_star
             # Lock in this APoI value with a small tolerance
-            add_ineq( row_i, val_t + 1e-6)
-            add_ineq(-row_i, -(val_t - 1e-6))
+            add_ineq( row_i, val_t + LOCK_IN_TOL)
+            add_ineq(-row_i, -(val_t - LOCK_IN_TOL))
 
         except RuntimeError:
             # If pushing this priority further is infeasible, skip it
