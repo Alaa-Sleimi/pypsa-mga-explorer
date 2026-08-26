@@ -182,9 +182,11 @@ def _fingerprint_object(network, poi_definitions, epsilon) -> dict:
         "n_snapshots": int(len(network.snapshots)),
         "snapshot_weightings": _timeseries_digest(network.snapshot_weightings),
         "components": components,
-        # PoI order matters (it fixes P_all's rows), so keep it as given.
+        # PoI order matters (it fixes P_all's rows), so keep it as given. The
+        # carriers list is hashed in order too, since it is part of the PoI's
+        # identity (json.dumps preserves list order; sort_keys only sorts dicts).
         "poi_definitions": [
-            [d.get("carrier"), d.get("name"), d.get("unit", "GW")]
+            [d.get("component"), d.get("carriers"), d.get("name"), d.get("unit", "GW")]
             for d in poi_definitions
         ],
     }
