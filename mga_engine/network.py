@@ -1,5 +1,8 @@
-"""
-network.py — Example 3-bus PyPSA capacity-expansion network.
+"""Small example PyPSA capacity-expansion network for demos and tests.
+
+Provides :func:`build_network`, a deterministic 3-bus toy system small enough to run
+the whole MGA pipeline in seconds. It is not on the exploration path: the notebook
+defines its own network factory, so this module exists for tests and manual trials.
 
 Topology:
     north -- south -- east
@@ -38,7 +41,23 @@ WEIGHT      = 8760 / N_SNAPSHOTS
 
 
 def build_network() -> pypsa.Network:
-    """Build and return the example network (not yet optimised)."""
+    """Build the example 3-bus network, unsolved.
+
+    Returns
+    -------
+    pypsa.Network
+        Unsolved network with 72 snapshots, three AC buses, two fixed-capacity lines,
+        four extendable generators (two solar, one wind, one gas) and one fixed load
+        per bus.
+
+    Notes
+    -----
+    Deterministic and side-effect free: the solar and wind availabilities are
+    closed-form sine profiles, so repeated calls return identical networks. Power is
+    in MW, capital cost in EUR/MW/yr and marginal cost in EUR/MWh; snapshot weights
+    are 8760 / 72 h and sum to one year, which makes the objective an annual cost.
+    ``Network.sanitize()`` runs before returning, which fills in missing carriers.
+    """
 
     n = pypsa.Network()
     n.set_snapshots(range(N_SNAPSHOTS))
@@ -101,17 +120,3 @@ def build_network() -> pypsa.Network:
 
     n.sanitize()
     return n
-
-
-if __name__ == "__main__":
-    network = build_network()
-    status, _ = network.optimize(
-        solver_name="highs",
-        include_objective_constant=False,  # keeps objective as pure total system cost
-    )
-
-    print(f"Status       : {status}")
-    print(f"Optimal cost : {network.objective:,.0f} €/yr")
-    print()
-    print("Optimal capacities [MW]:")
-    print(network.generators[["carrier", "p_nom_opt"]])

@@ -213,15 +213,26 @@ EPSILON_FOR_FINGERPRINT = 0.05
 
 @pytest.fixture(scope="module")
 def fingerprint_network():
-    """An UNSOLVED example network + its PoI definitions.
+    """An UNSOLVED example network + PoI definitions for it (current format).
+
+    The definitions are written inline for the 3-bus example network's solar and
+    wind generators. make_poi_specs() is called once as a guard, so the fixture
+    fails loudly if the definitions stop matching the network or the definition
+    format; it only reads carrier membership and does not solve anything.
 
     network_fingerprint()/check_state() read only pre-solve metadata, so no
     optimize() call is needed anywhere in this fixture — no solver runs.
     """
     from mga_engine.network import build_network
-    from mga_engine.poi import POI_DEFINITIONS
+    from mga_engine.poi import make_poi_specs
 
-    return build_network(), POI_DEFINITIONS
+    poi_definitions = [
+        {"component": "generator", "carriers": ["solar"], "name": "solar_cap_gw"},
+        {"component": "generator", "carriers": ["wind"],  "name": "wind_cap_gw"},
+    ]
+    network = build_network()
+    make_poi_specs(network, poi_definitions)   # guard: fails loudly if the definitions go stale again (no solve)
+    return network, poi_definitions
 
 
 def _save_state_with_fingerprint(path, state, network, poi_definitions, seed):

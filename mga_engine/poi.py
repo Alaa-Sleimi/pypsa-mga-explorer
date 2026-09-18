@@ -1,5 +1,9 @@
-"""
-poi.py — Properties of Interest (PoI) definitions.
+"""Properties of Interest (PoI): the solution metrics the MGA search explores.
+
+A PoI is one scalar summary of a solution — here the total installed capacity, in GW,
+of one or more carriers. Every other module works in PoI space, so this module is
+where a network's components are turned into the two representations the pipeline
+needs, and where the PoI ORDER is fixed that later becomes the row order of ``P_all``.
 
 Each PoiSpec bundles two representations of the same quantity:
   - evaluate(network)  : compute the scalar value from a solved network
@@ -44,16 +48,25 @@ _CAPACITY_COMPONENTS = {
 
 @dataclass
 class PoiSpec:
-    """Bundles the two representations of one PoI: an `evaluate` callable and a
-    `linopy_expr` callable for the same quantity.
+    """One PoI in its two equivalent representations.
 
     Attributes
     ----------
-    name        : str — PoI identifier (row label in P_all)
-    unit        : str — display unit label
-    evaluate    : Callable[[pypsa.Network], float] — value from a solved network
-    linopy_expr : Callable[[linopy.Model], linopy.LinearExpression] — the same
-                  quantity as an optimisation expression
+    name : str
+        PoI identifier; also this PoI's row label in ``P_all``.
+    unit : str
+        Display label only. The value is always in GW.
+    evaluate : callable
+        ``evaluate(network) -> float``: the value read from a SOLVED network.
+    linopy_expr : callable
+        ``linopy_expr(model) -> linopy.LinearExpression``: the same quantity as an
+        optimisation expression, usable as an objective or a constraint.
+
+    Notes
+    -----
+    Both callables close over the component names resolved when the spec was built,
+    not over the network object, so a spec built on one network can be evaluated on
+    another network that has the same component names.
     """
 
     name: str
@@ -69,32 +82,40 @@ def capacity_poi(
     name: str,
     unit: str = "GW",
 ) -> PoiSpec:
-    """Build a PoiSpec for the total installed capacity of one or more carriers.
+    """Build a PoI for the total installed capacity of one or more carriers.
 
-    Works for any PyPSA network: `component` selects which component holds the
-    capacity ("generator" -> Generator-p_nom, "link" -> Link-p_nom,
-    "storage_unit" -> StorageUnit-p_nom) and
-    `carriers` lists the carriers to sum into this single PoI (e.g. offshore
-    wind split across two carriers). Both representations sum nominal power over
-    the matching components and convert MW -> GW:
-      - evaluate(net) : sum of p_nom_opt      (from a solved network)
-      - linopy_expr(m): sum of <Component>-p_nom  (the optimisation variable)
+    Parameters
+    ----------
+    network : pypsa.Network
+        Network to resolve the carriers against; need not be solved.
+    carriers : list of str or tuple of str
+        Carriers summed into this one PoI. A bare string is rejected.
+    component : {"generator", "link", "storage_unit"}
+        Component holding the capacity, i.e. ``<Component>-p_nom``.
+    name : str
+        PoI identifier; also this PoI's row label in ``P_all``.
+    unit : str, default "GW"
+        Display label only; the value is always GW.
 
-    PyPSA only creates the -p_nom variable for EXTENDABLE components, so
-    linopy_expr sums the variable over the extendable matches and adds the fixed
-    capacity of the non-extendable ones as a constant. That keeps it numerically
-    identical to evaluate(), which reads p_nom_opt for every match.
-
-    The value is always in GW; `unit` is the display label and should stay "GW".
-    The network need not be solved — only carrier membership is read here.
+    Returns
+    -------
+    PoiSpec
+        ``evaluate`` sums ``p_nom_opt`` over every match; ``linopy_expr`` sums the
+        ``-p_nom`` variable over the extendable matches (the only ones PyPSA creates
+        a variable for) plus the fixed capacity of the rest, so the two agree. Both
+        convert MW to GW.
 
     Raises
     ------
     ValueError
-        If `component` is not "generator"/"link"/"storage_unit", if `carriers`
-        is not a non-empty list, if any carrier matches no component in this
-        network, or if no match is extendable (the PoI would be a constant,
-        leaving nothing for the MGA search to vary).
+        Unsupported `component`; `carriers` not a non-empty list or tuple; a carrier
+        matching nothing here; or no extendable match, which would make this PoI a
+        constant with nothing for the MGA search to vary.
+
+    Notes
+    -----
+    For links ``p_nom`` is the ``bus0`` INPUT capacity: a hydrogen turbine link is
+    measured in GW of hydrogen in, not electricity out.
     """
     if component not in _CAPACITY_COMPONENTS:
         raise ValueError(
@@ -138,9 +159,11 @@ def capacity_poi(
         )
 
     def _eval(net):
+        """Sum p_nom_opt [MW] over the matched components of `net` and return GW."""
         return float(getattr(net, static_attr).loc[matched_names, "p_nom_opt"].sum()) / MW_TO_GW
 
     def _expr(m):
+        """Return the same capacity in GW as a linopy expression over model `m`."""
         expr = m.variables[var_name].sel(name=ext_names).sum()
         if fixed_mw:
             expr = expr + fixed_mw
@@ -159,12 +182,33 @@ def make_poi_specs(
     network: pypsa.Network,
     definitions: List[dict],
 ) -> List[PoiSpec]:
-    """Build the list of PoiSpecs from a declarative list of definitions.
+    """Build the ordered list of PoI specs from declarative definitions.
 
-    Each definition is a dict of keyword arguments for capacity_poi, e.g.
-    {"component": "generator", "carriers": ["solar"], "name": "solar_cap_gw"}.
-    The order is significant: it fixes the PoI row order of P_all, so it must
-    match whatever the preparation phase was run with.
+    Parameters
+    ----------
+    network : pypsa.Network
+        Network the definitions are resolved against; need not be solved.
+    definitions : list of dict
+        One dict per PoI, passed as keyword arguments to :func:`capacity_poi`, e.g.
+        ``{"component": "generator", "carriers": ["solar"], "name": "solar_cap_gw"}``.
+        Required keys: ``component``, ``carriers``, ``name``; optional: ``unit``.
+
+    Returns
+    -------
+    list of PoiSpec
+        Specs in definition order.
+
+    Raises
+    ------
+    ValueError
+        `definitions` is None, an entry is not a dict, a required key is missing, or
+        an unknown key is present (``"carrier"`` is hinted towards ``"carriers"``);
+        plus anything :func:`capacity_poi` raises.
+
+    Notes
+    -----
+    The order is significant: it fixes the PoI row order of ``P_all`` and must match
+    what the preparation phase was run with.
     """
     if definitions is None:
         raise ValueError(
@@ -197,29 +241,25 @@ def make_poi_specs(
 
 
 def evaluate_all(specs: List[PoiSpec], network: pypsa.Network) -> np.ndarray:
-    """Return the full PoI vector p = [poi_0, ..., poi_{m-1}] for a solved network."""
+    """Evaluate every PoI on a solved network.
+
+    Parameters
+    ----------
+    specs : list of PoiSpec
+        Specs to evaluate, in the intended PoI order.
+    network : pypsa.Network
+        Solved network; each ``evaluate`` reads ``p_nom_opt``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(m,)``. The PoI vector ``p = [poi_0, ..., poi_{m-1}]`` in GW,
+        ordered like `specs`.
+
+    Notes
+    -----
+    On an UNSOLVED network PyPSA's ``p_nom_opt`` column exists and is all zeros, so
+    this silently returns zeros instead of raising. Make sure the network has been
+    optimised, or the caller will read a valid-looking all-zero PoI vector.
+    """
     return np.array([s.evaluate(network) for s in specs], dtype=float)
-
-
-if __name__ == "__main__":
-    from mga_engine.network import build_network
-
-    network = build_network()
-    network.optimize(
-        solver_name="highs",
-        include_objective_constant=False,  # keeps objective as pure total system cost
-    )
-
-    # One single-carrier generator PoI per carrier the demo network happens to
-    # have — derived from the network, so no carrier name is hardcoded here.
-    definitions = [
-        {"component": "generator", "carriers": [c], "name": f"{c}_cap_gw"}
-        for c in sorted(network.generators.carrier.unique())
-    ]
-
-    specs = make_poi_specs(network, definitions)
-    p_star = evaluate_all(specs, network)
-
-    print("PoI vector p* at optimal solution:")
-    for spec, val in zip(specs, p_star):
-        print(f"  {spec.name:<20s}  {val:.4f} {spec.unit}")

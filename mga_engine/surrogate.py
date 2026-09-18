@@ -47,12 +47,19 @@ Contract
 Callers holding a navigation result as alpha weights should pass
 ``p = P @ alpha`` and the same ``P`` used elsewhere in the notebook.
 
-NOTE ON highspy: the MILP is assembled through highspy's Highs() API using
-addVars / addConstrs-style row addition via the low-level model interface.
-The exact call names in highspy have shifted across releases; the single
-place that touches highspy is ``_solve_milp``. If your highspy version
-rejects a call there, that function is the only thing to adjust -- the rest
-of the module is pure numpy/scipy.
+Reached only through ``solve_surrogate_costs``. Nothing else in ``mga_engine``
+imports this module, and the notebook calls it once, in its surrogate-cost
+section, after navigation has produced a target. ``signed_boundary_distance``
+and ``project_to_boundary`` are public because the tests exercise them
+directly; inside the package they are used only by ``solve_surrogate_costs``.
+
+NOTE ON highspy: the MILP is assembled through highspy's Highs() API, using
+``addVars`` for the columns, ``changeColsIntegrality`` / ``changeColsCost``
+for integrality and objective, and one ``addRows`` call for the whole sparse
+constraint matrix. The exact call names in highspy have shifted across
+releases; the single place that touches highspy is ``_solve_milp``. If your
+highspy version rejects a call there, that function is the only thing to
+adjust -- the rest of the module is pure numpy/scipy.
 """
 
 from __future__ import annotations
@@ -72,7 +79,7 @@ except ImportError:  # pragma: no cover
         _QhullError = Exception  # fallback: catch broadly if unavailable
 
 
-# HiGHS seed for the SP(p) MILP solve — fixed (together with threads=1) so
+# HiGHS seed for the SP(p) MILP solve - fixed (together with threads=1) so
 # tie-breaking in the MIP search is run-to-run deterministic.
 MILP_RANDOM_SEED = 0
 
@@ -82,7 +89,37 @@ MILP_RANDOM_SEED = 0
 # --------------------------------------------------------------------------- #
 @dataclass
 class SurrogateResult:
-    """Outcome of a surrogate cost recovery."""
+    """Outcome of one surrogate cost recovery.
+
+    Returned by :func:`solve_surrogate_costs` for every outcome, success or failure;
+    that function raises only for malformed input, never for a solver result.
+
+    Attributes
+    ----------
+    r : numpy.ndarray or None
+        Shape ``(m,)``. The recovered cost vector, L1-normalised unless the caller
+        passed ``normalize=False``. ``None`` when `status` is ``"failed"``.
+    status : str
+        ``"boundary"`` (solved at `p` itself), ``"projected"`` (`p` was interior, or
+        numerically eps-interior, and was moved first), or ``"failed"``.
+    projected : bool
+        Whether `p` was moved before solving. True for both projection paths.
+    p_used : numpy.ndarray or None
+        Shape ``(m,)``. The point actually handed to the MILP. ``None`` only when
+        projection itself failed.
+    projection_distance : float
+        Euclidean distance `p` was moved, in PoI units (GW); ``0.0`` when it was not.
+    w : float or None
+        The MILP's infinity-norm objective. Diagnostic: it is the inf-norm of the RAW
+        r, not of the L1-normalised `r` returned above.
+    message : str
+        Human-readable explanation of what happened, suitable for printing.
+    extras : dict
+        Empty on failure. On success: ``"r_raw"`` (the un-normalised vector),
+        ``"alpha"`` (the convex weights the MILP found), ``"lambda"`` (the supporting
+        hyperplane's level), ``"l1_norm_raw"`` (the divisor used), and
+        ``"boundary_distance"`` (the signed distance of the ORIGINAL `p`).
+    """
 
     r: Optional[np.ndarray]          # recovered cost vector (m,), normalized; None on failure
     status: str                      # "boundary" | "projected" | "failed"
@@ -98,10 +135,28 @@ class SurrogateResult:
 # Geometry: boundary distance and projection
 # --------------------------------------------------------------------------- #
 def _hull_facets(P: np.ndarray):
-    """Return (A, b) with rows a_k, b_k for facets a_k . x <= b_k of conv(P).
+    """Return the facet inequalities ``a_k . x <= b_k`` of conv(P).
 
-    ``P`` is (m, n); points are the n columns. Returns None if the hull is
-    degenerate / Qhull fails (caller falls back to an LP test).
+    Parameters
+    ----------
+    P : numpy.ndarray
+        Shape ``(m, n)``. Sample matrix; the points hulled are its n COLUMNS, so it
+        is transposed before being handed to Qhull.
+
+    Returns
+    -------
+    tuple of numpy.ndarray or None
+        ``(A, b)`` with `A` of shape ``(n_facets, m)`` and `b` of shape
+        ``(n_facets,)``, such that a point is in the hull exactly when
+        ``A @ x <= b``. ``None`` when Qhull fails, which happens for a degenerate
+        hull (fewer points than dimensions, or a lower-dimensional sample set) and
+        in high dimension; callers fall back to an LP test.
+
+    Notes
+    -----
+    Qhull reports each facet as ``[a_1 ... a_d, b0]`` meaning ``a . x + b0 <= 0``, so
+    ``b`` is the NEGATED last column. Qhull's normals are unit-norm, which is what
+    lets :func:`signed_boundary_distance` read the slack as a Euclidean distance.
     """
     pts = np.asarray(P, dtype=float).T  # (n_points, dim)
     try:
@@ -116,15 +171,29 @@ def _hull_facets(P: np.ndarray):
 
 
 def signed_boundary_distance(p: np.ndarray, P: np.ndarray) -> float:
-    """Signed distance from p to the boundary of conv(P).
+    """Signed distance from `p` to the boundary of conv(P).
 
-    Positive  -> strictly inside (min slack to any facet).
-    ~zero     -> on the boundary.
-    Negative  -> outside the hull.
+    Parameters
+    ----------
+    p : numpy.ndarray
+        Shape ``(m,)``. Point in PoI space, in GW. Flattened on entry.
+    P : numpy.ndarray
+        Shape ``(m, n)``. Sample matrix; columns are samples.
 
-    Falls back to an LP-based interiority test when Qhull is unavailable
-    (high dimension). The fallback returns a *signed* value of the same
-    sign convention but not a true Euclidean distance.
+    Returns
+    -------
+    float
+        Positive when `p` is strictly inside, as the smallest slack to any facet;
+        about zero on the boundary; negative outside the hull.
+
+    Notes
+    -----
+    On the Qhull path the value is a true Euclidean distance in GW, because Qhull's
+    facet normals are unit-norm. When Qhull fails the result comes from
+    :func:`_lp_boundary_distance` instead, which keeps the sign convention but is
+    NOT a distance, so the magnitude is not comparable between the two paths and
+    ``tol_interior`` in :func:`solve_surrogate_costs` means something different
+    under each.
     """
     p = np.asarray(p, dtype=float).ravel()
     facets = _hull_facets(P)
@@ -137,20 +206,36 @@ def signed_boundary_distance(p: np.ndarray, P: np.ndarray) -> float:
 
 
 def _lp_boundary_distance(p: np.ndarray, P: np.ndarray) -> float:
-    """LP fallback interiority test for high-dimensional conv(P).
+    """LP fallback interiority test for a conv(P) Qhull could not build.
 
-    Solves the Chebyshev-style expansion: how far can we push p in the
-    "most interior" sense while staying representable as a convex
-    combination? We use the max-slack LP
+    Solves the max-slack LP
 
-        max  t
-        s.t. P a = p,  1'a = 1,  a >= t,  a <= 1
+        max  t   s.t.  P a = p,  1'a = 1,  a >= t,  a <= 1
 
-    If the optimal t* > 0, every sample carries strictly positive weight,
-    which is a sufficient condition for p to be interior; we return t* as a
-    positive (interior) signal. If infeasible or t* <= 0, we return a small
-    non-positive value flagging boundary/exterior. This is a conservative
-    proxy, not a Euclidean distance -- adequate only as a fallback.
+    If the optimum ``t* > 0`` every sample carries strictly positive weight, which is
+    sufficient for `p` to be in the relative interior, so ``t*`` is returned as a
+    positive signal.
+
+    Parameters
+    ----------
+    p : numpy.ndarray
+        Shape ``(m,)``. Point in PoI space, already flattened.
+    P : numpy.ndarray
+        Shape ``(m, n)``. Sample matrix; columns are samples.
+
+    Returns
+    -------
+    float
+        ``t*`` when the LP solves, which is at most ``1 / n``; ``-1.0`` when the LP
+        is infeasible, i.e. `p` is not a convex combination of the samples at all
+        and is treated as exterior.
+
+    Notes
+    -----
+    A conservative proxy, NOT a Euclidean distance: the magnitude is bounded by
+    ``1 / n`` however deep inside `p` sits, so it shrinks as samples are added and is
+    not comparable with the Qhull path's values. Adequate only as a fallback.
+    One SciPy/HiGHS LP; ``linprog`` is imported inside the function.
     """
     from scipy.optimize import linprog
 
@@ -183,13 +268,36 @@ def _lp_boundary_distance(p: np.ndarray, P: np.ndarray) -> float:
 
 
 def project_to_boundary(p: np.ndarray, P: np.ndarray):
-    """Project an interior p onto the surface of conv(P).
+    """Project a point onto the nearest point of the surface of conv(P).
 
-    Reading (ii): nearest point on the hull *boundary*. For each facet, we
-    project p onto the facet's hyperplane; among the projections that land
-    inside the hull (all facet constraints satisfied up to tolerance), we
-    take the closest. Returns (p_hat, distance). If no valid projection is
-    found (e.g. Qhull unavailable), returns (None, inf).
+    For each facet, `p` is projected onto that facet's hyperplane; among the
+    projections that land inside the hull, with every facet constraint satisfied to
+    within 1e-9, the closest is returned.
+
+    Parameters
+    ----------
+    p : numpy.ndarray
+        Shape ``(m,)``. Point to project, in GW. Flattened on entry.
+    P : numpy.ndarray
+        Shape ``(m, n)``. Sample matrix; columns are samples.
+
+    Returns
+    -------
+    p_hat : numpy.ndarray or None
+        Shape ``(m,)``. The projected point, or ``None`` if none was found.
+    distance : float
+        Euclidean distance moved, in GW, or ``inf`` alongside a ``None`` point.
+
+    Notes
+    -----
+    Returns ``(None, inf)`` when Qhull cannot build the hull, and also when every
+    hyperplane projection falls outside it, which happens when the nearest surface
+    point lies on a lower-dimensional face rather than in a facet's interior. The
+    projection is therefore a heuristic, and :func:`solve_surrogate_costs` reports a
+    failure rather than raising when it does not find one.
+    Called with an interior point in normal use, but nothing enforces that: given an
+    exterior `p` it returns the nearest hyperplane projection that lies inside the
+    hull, if one exists.
     """
     p = np.asarray(p, dtype=float).ravel()
     facets = _hull_facets(P)
@@ -223,13 +331,47 @@ def project_to_boundary(p: np.ndarray, P: np.ndarray):
 # The MILP
 # --------------------------------------------------------------------------- #
 def _solve_milp(p_solve: np.ndarray, P: np.ndarray, big_bound: float = 1e3):
-    """Solve the SP(p) MILP at ``p_solve`` using highspy.
+    """Solve the SP(p) MILP at ``p_solve`` with highspy.
 
-    Returns a dict {feasible, r, alpha, lam, w} where r/alpha/lam/w are None
-    if infeasible.
+    Parameters
+    ----------
+    p_solve : numpy.ndarray
+        Shape ``(m,)``. The point to make optimal, in GW. Flattened on entry.
+    P : numpy.ndarray
+        Shape ``(m, n)``. Sample matrix; columns are samples.
+    big_bound : float, default 1e3
+        Box bound on every ``r_i``, on ``lambda`` and on ``w``. Also fixes the big-M
+        of the sign disjunction at ``big_bound + 1``, the tightest M valid for that
+        box.
 
-    Variable order in the flat vector x:
-        alpha[0..n-1], r[0..m-1], lam, z_plus[0..m-1], z_minus[0..m-1], w
+    Returns
+    -------
+    dict
+        Always has ``"feasible"`` (bool) and ``"model_status"`` (the HiGHS status as
+        a string, or ``"Optimal"``). On success it also carries ``"r"`` of shape
+        ``(m,)``, ``"alpha"`` of shape ``(n,)``, and the floats ``"lam"`` and
+        ``"w"``; on failure those four are ``None``.
+
+    Raises
+    ------
+    ImportError
+        If highspy is not installed. The import is inside this function, so the rest
+        of the module works without it.
+
+    Notes
+    -----
+    Variable order in the flat vector: ``alpha[0..n-1]``, ``r[0..m-1]``, ``lambda``,
+    ``z_plus[0..m-1]``, ``z_minus[0..m-1]``, ``w``.
+    Deterministic by construction: ``threads=1`` and ``random_seed=MILP_RANDOM_SEED``
+    pin the MIP search, so the same input returns the same optimal r rather than an
+    arbitrary member of the optimal set.
+    ``big_bound`` bounds ``lambda = r'p`` as well as r itself. A point whose only
+    supporting hyperplanes need ``|r'p| > big_bound`` is therefore reported
+    infeasible rather than solved, which is reachable when PoI values are large:
+    with ``|r_i| >= 1`` forced on at least one coordinate, ``|r'p|`` grows with the
+    magnitude of `p_solve`.
+    Any status other than optimal, infeasible and time-limit alike, collapses to
+    ``feasible=False``; ``model_status`` is the only way to tell them apart.
     """
     import highspy
 
@@ -297,6 +439,23 @@ def _solve_milp(p_solve: np.ndarray, P: np.ndarray, big_bound: float = 1e3):
     rows_upper = []
 
     def add_row(coeffs: dict, lo: float, hi: float):
+        """Append one constraint row ``lo <= a . x <= hi`` to the pending CSR arrays.
+
+        Parameters
+        ----------
+        coeffs : dict
+            Maps a flat variable index to its coefficient. Zero coefficients are
+            dropped, keeping the row sparse.
+        lo, hi : float
+            Row bounds. Equal values give an equality; ``highspy.kHighsInf`` on one
+            side gives a one-sided inequality.
+
+        Returns
+        -------
+        None
+            Appends to the enclosing ``rows_*`` lists, which are handed to
+            ``addRows`` in one call once every row has been built.
+        """
         rows_start.append(len(rows_index))
         for j, v in coeffs.items():
             if v != 0.0:
@@ -389,26 +548,53 @@ def solve_surrogate_costs(
     tol_interior: Optional[float] = None,
     normalize: bool = True,
 ) -> SurrogateResult:
-    """Recover a surrogate cost vector r for the point p over samples P.
+    """Recover a surrogate cost vector r that makes `p` optimal over the samples P.
+
+    Classifies `p` against the boundary of conv(P), projects it first if it is
+    interior, solves the SP(p) MILP, and retries once from the hull surface if a
+    point classified as on the boundary turns out to have no exact supporting
+    hyperplane.
 
     Parameters
     ----------
-    p : (m,) array
-        The PoI vector for the point of interest (e.g. a navigation target).
-    P : (m, n) array
-        Sample matrix; columns are samples in PoI space.
+    p : numpy.ndarray
+        Shape ``(m,)``. The PoI vector of the point of interest, in GW, typically a
+        navigation target reconstructed as ``P @ alpha``.
+    P : numpy.ndarray
+        Shape ``(m, n)``. Sample matrix; columns are samples in PoI space.
     tol_interior : float, optional
-        Points with signed boundary distance above this are treated as
-        interior and projected. Defaults to 1e-4 * (smallest PoI range),
-        which also absorbs the ~1e-6 navigation lock-in offset.
-    normalize : bool
-        If True (default), return r rescaled to ||r||_1 = 1. The MILP
-        natively produces the ||r||_inf = 1 representative; both lie on the
-        same solution ray, so rescaling is exact.
+        Keyword-only. Points whose signed boundary distance exceeds this are treated
+        as interior and projected. Defaults to ``1e-4`` times the smallest non-zero
+        PoI range in `P`, which is wide enough to absorb the roughly 1e-6 lock-in
+        offset :mod:`mga_engine.navigation` leaves on its targets.
+    normalize : bool, default True
+        Keyword-only. Return r rescaled to ``||r||_1 = 1``. The MILP natively returns
+        the ``||r||_inf`` minimal representative; both lie on the same solution ray,
+        so the rescaling is exact and changes nothing about which point is optimal.
 
     Returns
     -------
     SurrogateResult
+        Carrying `r` and ``status="boundary"`` or ``"projected"`` on success, or
+        ``r=None`` and ``status="failed"`` with an explanatory message.
+
+    Raises
+    ------
+    ValueError
+        If ``len(p)`` does not equal ``P.shape[0]``. A `P` that is not 2-D raises the
+        same type from the shape unpacking, with a less helpful message.
+
+    Notes
+    -----
+    Solver failures never raise: every one of them comes back as a ``"failed"``
+    result, so a caller has to read `status` rather than rely on exceptions.
+    One or two MILP solves and up to three hull constructions per call.
+    Points OUTSIDE the hull are not detected as such: a negative distance skips the
+    projection branch and the MILP is solved at `p` itself, which usually succeeds
+    and reports ``status="boundary"`` even though the point is not in conv(P).
+    When Qhull cannot build the hull, :func:`signed_boundary_distance` falls back to
+    an LP proxy whose scale differs, and :func:`project_to_boundary` then returns
+    nothing, so a point the proxy calls interior always ends as ``"failed"``.
     """
     p = np.asarray(p, dtype=float).ravel()
     P = np.asarray(P, dtype=float)

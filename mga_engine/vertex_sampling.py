@@ -1,14 +1,15 @@
-"""
-vertex_sampling.py — Vertex sampling via MP(r).
+"""Vertex sampling of the near-optimal PoI space via MP(r).
 
-For each random direction r ∈ R^m we solve:
+Second step of the preparation phase. Every random direction r in R^m is minimised
+over the near-optimal feasible set,
 
-    MP(r): min  r'p  =  r'Dx
-           s.t. x ∈ F^M
-                (i.e. Ax ≤ b  AND  c'x ≤ (1 + ε) · c'x*)
+    MP(r): min  r'p = r'Dx
+           s.t. x in F^M   (i.e. Ax <= b  AND  c'x <= (1 + epsilon) * c'x*)
 
-Each solve gives one extreme point of F^P in the direction r.
-We collect n_samples such points to build the matrix P_vertices (m × n_samples).
+so each solve returns one extreme point of the PoI-space projection F^P. The
+n_samples points collected here outline the near-optimal space; together with the
+points from :mod:`mga_engine.interior_sampling` they are the samples that
+:mod:`mga_engine.gp_solver` prices.
 """
 
 import numpy as np
@@ -22,9 +23,31 @@ def _build_mga_model(
     opt_cost: float,
     epsilon: float,
 ) -> None:
-    """Create a fresh Linopy model on `network` (pypsa.Network) and add the MGA
-    cost-slack constraint using `opt_cost` (float) and `epsilon` (float).
-    Returns None; the model is left on network.model."""
+    """Build a fresh linopy model on `network` and add the MGA cost-slack constraint.
+
+    Parameters
+    ----------
+    network : pypsa.Network
+        Network to build the model on. Any existing ``network.model`` is replaced.
+    opt_cost : float
+        Minimum system cost c'x* in EUR/yr. Must come from a solve with
+        ``include_objective_constant=False``, as used here, or the slack is off by
+        PyPSA's objective constant.
+    epsilon : float
+        Relative cost slack. The constraint added is
+        ``objective <= (1 + epsilon) * opt_cost``.
+
+    Returns
+    -------
+    None
+        The model is left on ``network.model``, carrying the slack row named
+        ``"mga_slack"``.
+
+    Notes
+    -----
+    Prints the slack right-hand side. A negative `opt_cost` would turn the slack into
+    a constraint tighter than the optimum; this is not checked.
+    """
     network.optimize.create_model(include_objective_constant=False)
     m = network.model
     mga_rhs = (1.0 + epsilon) * opt_cost
@@ -40,9 +63,38 @@ def _solve_mp(
     poi_specs: List[PoiSpec],
     direction: np.ndarray,
 ) -> np.ndarray:
-    """Solve MP(r) on the prepared model for `direction` (np.ndarray, shape (m,))
-    over `poi_specs` (List[PoiSpec]); returns the PoI vector (np.ndarray, shape
-    (m,)). Raises RuntimeError if the solve status is not "ok"."""
+    """Solve MP(r) on the already-built model and return the PoI vector it reaches.
+
+    Parameters
+    ----------
+    network : pypsa.Network
+        Network whose ``network.model`` was prepared by :func:`_build_mga_model`;
+        the ``"mga_slack"`` constraint must already be on it.
+    poi_specs : list of PoiSpec
+        PoI specs defining the coordinates, in the intended row order.
+    direction : numpy.ndarray
+        Shape ``(m,)``. The direction r. The objective becomes
+        ``sum_i direction[i] * poi_i`` and is MINIMISED, so r points away from the
+        face being sampled.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(m,)``. PoI values at the optimum, in GW, from
+        :func:`mga_engine.poi.evaluate_all`.
+
+    Raises
+    ------
+    RuntimeError
+        If the solver status is not ``"ok"``.
+
+    Notes
+    -----
+    Calls HiGHS. Mutates `network`: the model objective is overwritten and the
+    solution is written into the result columns. The cost objective is gone
+    afterwards (the cost slack survives as a constraint), so the model can only be
+    reused for further MP(r) solves.
+    """
     m = network.model
 
     new_obj = sum(
@@ -70,12 +122,44 @@ def sample_vertices(
     n_samples: int = 10,
     seed: int = 42,
 ) -> np.ndarray:
-    """
-    Sample n_samples vertices of F^P by solving MP(r) with random directions.
+    """Sample `n_samples` vertices of F^P by solving MP(r) for random directions.
+
+    Parameters
+    ----------
+    network : pypsa.Network
+        Unsolved network. Its model is rebuilt here and then reused for every
+        direction, so one network object serves the whole sweep.
+    poi_specs : list of PoiSpec
+        PoI specs for `network`, in the intended row order of the result.
+    opt_cost : float
+        Minimum system cost c'x* in EUR/yr; see :func:`_build_mga_model`.
+    epsilon : float, default 0.05
+        Relative cost slack defining the near-optimal set.
+    n_samples : int, default 10
+        Number of random directions, i.e. of columns in the result.
+    seed : int, default 42
+        Seed of the ``numpy.random.default_rng`` that draws the directions.
 
     Returns
     -------
-    P_vertices : np.ndarray of shape (m, n_samples)
+    numpy.ndarray
+        Shape ``(m, n_samples)``. Column k holds the PoI vector in GW returned by
+        MP(r) for direction k.
+
+    Raises
+    ------
+    RuntimeError
+        Propagated from the first failed MP(r) solve; the sweep aborts and no
+        partial matrix is returned.
+
+    Notes
+    -----
+    Directions are standard normal vectors normalised to unit length, so the same
+    `seed` reproduces exactly the same directions; whether identical directions also
+    give identical vertices depends on the solver's tie-breaking, since a degenerate
+    LP can have a whole optimal face. For the same reason a returned point need not
+    be a vertex, and "vertex" here is nominal.
+    Calls HiGHS `n_samples` times and prints one line per sample.
     """
     rng = np.random.default_rng(seed)
     m_dim = len(poi_specs)
@@ -94,37 +178,3 @@ def sample_vertices(
         print(f"  [{k+1}/{n_samples}]  p = {np.round(p, 3)}")
 
     return P_vertices
-
-
-if __name__ == "__main__":
-    import logging, warnings
-    logging.getLogger("linopy").setLevel(logging.WARNING)
-    logging.getLogger("pypsa").setLevel(logging.WARNING)
-    warnings.filterwarnings("ignore", message=".*experimental.*", category=UserWarning, module="linopy")
-
-    from mga_engine.network import build_network
-    from mga_engine.poi import make_poi_specs, evaluate_all
-
-    # --- Baseline solve ---
-    network = build_network()
-    _, _ = network.optimize(
-        solver_name="highs",
-        include_objective_constant=False,
-    )
-    opt_cost = network.objective
-    poi_specs = make_poi_specs(network)
-    p_star = evaluate_all(poi_specs, network)
-    print(f"Optimal cost : {opt_cost:,.0f} €/yr")
-    print(f"p*           : {np.round(p_star, 3)}")
-
-    # --- Vertex sampling (epsilon=0 here to verify all points land on boundary) ---
-    network_mga = build_network()
-    P_vertices = sample_vertices(
-        network_mga, poi_specs, opt_cost,
-        epsilon=0,
-        n_samples=20,
-        seed=42,
-    )
-
-    print("\nSampled vertices (columns of P_vertices):")
-    print(np.round(P_vertices, 3))

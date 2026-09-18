@@ -1,26 +1,12 @@
-"""
-projection.py — Adaptive 2D projection of the near-optimal feasible space.
+"""On-demand 2-D projection of the true near-optimal space onto a pair of PoIs.
 
-For a chosen pair of PoIs (i, j) we compute the TRUE boundary of the projection
-of F^P onto the (PoI_i, PoI_j) plane, by solving MP(r) for directions that are
-zero in all PoI coordinates except i and j.
-
-Directions are chosen adaptively (edge-normal refinement):
-  1. Seed with 4 axis-aligned directions: max/min PoI_i, max/min PoI_j.
-  2. Build the 2D convex hull of the points found so far.
-  3. For each hull edge, take its OUTWARD normal as the next direction and
-     maximize PoI along it (via MP(r) with the negated normal, since _solve_mp
-     minimizes r'p).
-  4. If the new point lies outside the current hull by more than a relative
-     threshold, add it and repeat. Stop when no edge can be pushed further or
-     the iteration cap is reached.
-
-The result is the convex hull of the 2D projection — which avoids the problem
-that plotted sample points can appear interior in 2D because of the other
-dimensions.
-
-Computed on request per PoI pair, on a live network. Reuses the MP(r) machinery
-from vertex_sampling (_build_mga_model, _solve_mp).
+Exploration-phase plotting support. For a chosen PoI pair it computes the boundary of
+the projection of F^P onto that plane by solving MP(r) on a live network for
+directions confined to those two coordinates, which avoids the artefact that plotted
+sample points can look interior in 2-D merely because of the other dimensions.
+Reuses the MP(r) machinery of :mod:`mga_engine.vertex_sampling`; the cheap
+sample-space counterpart, which needs no network, is
+:mod:`mga_engine.alpha_projection`.
 """
 
 import numpy as np
@@ -39,14 +25,35 @@ def _solve_direction_2d(
     j: int,
     w: np.ndarray,
 ):
-    """
-    Maximize  w_x * PoI_i + w_y * PoI_j  over the near-optimal set.
+    """Maximise ``w[0] * PoI_i + w[1] * PoI_j`` over the near-optimal set.
 
-    _solve_mp minimizes r'p, so to MAXIMIZE along w we minimize along -w:
-    we build a full-length direction that is zero everywhere except
-    index i = -w_x and index j = -w_y.
+    Parameters
+    ----------
+    network : pypsa.Network
+        Network whose model was prepared by
+        :func:`mga_engine.vertex_sampling._build_mga_model`.
+    poi_specs : list of PoiSpec
+        All PoI specs of the network; only entries `i` and `j` enter the objective,
+        but the full list is needed to read the solution back.
+    i, j : int
+        Indices into `poi_specs` of the two PoIs spanning the plane.
+    w : numpy.ndarray
+        Shape ``(2,)``. In-plane direction to maximise along.
 
-    Returns the 2D point (PoI_i, PoI_j), or None if the solve failed.
+    Returns
+    -------
+    numpy.ndarray or None
+        Shape ``(2,)``. The point ``(PoI_i, PoI_j)`` in GW at the optimum, or
+        ``None`` if the solve failed.
+
+    Notes
+    -----
+    :func:`mga_engine.vertex_sampling._solve_mp` MINIMISES ``r'p``, so maximising
+    along `w` means minimising along ``-w``: the full-length direction is zero
+    everywhere except ``[i] = -w[0]`` and ``[j] = -w[1]``.
+    A ``RuntimeError`` from the solve is swallowed and reported as ``None``, so the
+    caller cannot distinguish an infeasible direction from any other solver failure.
+    Calls HiGHS and mutates `network`.
     """
     m_dim = len(poi_specs)
     direction = np.zeros(m_dim)
@@ -62,12 +69,25 @@ def _solve_direction_2d(
 
 
 def _outward_edge_normals(points_ccw: np.ndarray) -> List[np.ndarray]:
-    """
-    Given hull vertices in counter-clockwise order, return the OUTWARD unit
-    normal for each edge (v_k -> v_{k+1}).
+    """Return the outward unit normal of every edge of a CCW polygon.
 
-    For a CCW polygon, the outward normal of edge (dx, dy) is (dy, -dx)
-    normalized.
+    Parameters
+    ----------
+    points_ccw : numpy.ndarray
+        Shape ``(k, 2)``. Hull vertices in counter-clockwise order.
+
+    Returns
+    -------
+    list of numpy.ndarray
+        One unit vector of shape ``(2,)`` per edge ``v_k -> v_{k+1}``, in edge order.
+        For a CCW polygon the outward normal of edge ``(dx, dy)`` is ``(dy, -dx)``
+        normalised. Zero-length edges are skipped, so the list can be shorter than
+        `points_ccw`.
+
+    Notes
+    -----
+    Orientation is assumed, not checked: given clockwise input every normal points
+    inward instead.
     """
     normals = []
     n = len(points_ccw)
@@ -83,9 +103,25 @@ def _outward_edge_normals(points_ccw: np.ndarray) -> List[np.ndarray]:
 
 
 def _ccw_hull_vertices(pts: np.ndarray) -> np.ndarray:
-    """
-    Convex hull of a set of 2D points, returned as vertices in CCW order.
-    scipy's ConvexHull.vertices are already CCW for 2D input.
+    """Convex hull of a set of 2-D points, as vertices in counter-clockwise order.
+
+    Parameters
+    ----------
+    pts : numpy.ndarray
+        Shape ``(k, 2)``. Points to hull.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(h, 2)``. Hull vertices. SciPy reports ``ConvexHull.vertices`` in CCW
+        order for 2-D input, so no reordering is needed here.
+
+    Raises
+    ------
+    scipy.spatial.QhullError
+        If fewer than 3 points are given, or they are collinear. :func:`project_hull`
+        does NOT catch this, unlike the equivalent helper in
+        :mod:`mga_engine.alpha_projection`.
     """
     hull = ConvexHull(pts)
     return pts[hull.vertices]
@@ -101,26 +137,63 @@ def project_hull(
     max_iterations: int = 50,
     min_improvement: float = 1e-6,
 ) -> np.ndarray:
-    """
-    Compute the 2D convex-hull boundary of the near-optimal space projected
-    onto PoIs (i, j).
+    """Compute the 2-D boundary of the near-optimal space projected onto PoIs (i, j).
+
+    Adaptive edge-normal refinement: seed with the four axis-aligned directions
+    (max and min of each of the two PoIs), hull the points found so far, then shoot
+    each hull edge's outward normal and keep the returned point when it lies outside
+    the current hull by more than `min_improvement` relative to the hull's size.
+    Repeat until a round adds nothing or `max_iterations` rounds have passed.
 
     Parameters
     ----------
-    network        : PyPSA network (a fresh MGA model is built on it here)
-    poi_specs      : list of PoiSpec
-    opt_cost       : optimal total system cost c'x*
-    epsilon        : near-optimality slack
-    i, j           : indices (into poi_specs) of the two PoIs to project onto
-    max_iterations : cap on edge-normal refinement directions (safety net)
-    min_improvement: relative threshold; a new point is accepted only if it lies
-                     outside the current hull by more than this (scaled to hull
-                     size), which guards against solver-noise non-termination
+    network : pypsa.Network
+        Unsolved network. A fresh MGA model is built on it here and reused for every
+        direction, so the same object serves the whole projection.
+    poi_specs : list of PoiSpec
+        PoI specs for `network`, in the row order `i` and `j` index into.
+    opt_cost : float
+        Minimum system cost c'x* in EUR/yr; see
+        :func:`mga_engine.vertex_sampling._build_mga_model`.
+    epsilon : float
+        Relative cost slack defining the near-optimal set.
+    i, j : int
+        Indices into `poi_specs` of the two PoIs to project onto. Must differ.
+    max_iterations : int, default 50
+        Cap on refinement rounds, as a safety net rather than a normal stop.
+    min_improvement : float, default 1e-6
+        Relative acceptance threshold. A new point counts only if its support along
+        the shot normal beats the current hull's by more than
+        ``min_improvement * scale``, where ``scale`` is the norm of the seed points'
+        bounding-box diagonal. This is what stops solver noise from looping forever.
 
     Returns
     -------
-    hull_xy : np.ndarray of shape (k, 2)
-        Ordered (CCW) hull vertices in (PoI_i, PoI_j) coordinates.
+    numpy.ndarray
+        Shape ``(k, 2)``. Hull vertices in counter-clockwise order, in
+        ``(PoI_i, PoI_j)`` coordinates, in GW.
+
+    Raises
+    ------
+    ValueError
+        If ``i == j``.
+    RuntimeError
+        If fewer than 3 distinct seed points survive, which usually means the
+        projection is degenerate (a segment or a point).
+    scipy.spatial.QhullError
+        Propagated from :func:`_ccw_hull_vertices` when the points are collinear.
+        Unlike :func:`mga_engine.alpha_projection.compute_alpha_hull_2d`, this
+        function has no degenerate fallback.
+
+    Notes
+    -----
+    Calls HiGHS once per direction: 4 seeds plus one per accepted normal, on `network`
+    itself, whose model and result columns are overwritten throughout.
+    Individual failed direction solves are silently skipped and only counted, so a
+    hull can be built from fewer directions than were tried; the count is printed.
+    Reaching `max_iterations` is reported on stdout and leaves an APPROXIMATE hull,
+    inscribed in the true projection since every vertex is an attained point.
+    Each returned normal is shot at most once, within a cosine tolerance of 1e-3.
     """
     if i == j:
         raise ValueError("project_hull needs two DIFFERENT PoI indices (i != j).")
@@ -203,7 +276,26 @@ def project_hull(
 
 
 def _dedupe(points: List[np.ndarray], tol: float = 1e-9) -> List[np.ndarray]:
-    """Remove duplicate points (within tol)."""
+    """Drop points that duplicate an earlier one within an absolute tolerance.
+
+    Parameters
+    ----------
+    points : list of numpy.ndarray
+        Points of shape ``(2,)``, in the order they were found.
+    tol : float, default 1e-9
+        ABSOLUTE Euclidean tolerance, not scaled to the data. On PoI values in GW
+        this is effectively exact-duplicate removal.
+
+    Returns
+    -------
+    list of numpy.ndarray
+        The first occurrence of each distinct point, in input order.
+
+    Notes
+    -----
+    Compares every candidate against every kept point, so the cost is quadratic in
+    the number of survivors; fine for the handful of points a projection produces.
+    """
     out = []
     for p in points:
         if not any(np.linalg.norm(p - q) < tol for q in out):
@@ -212,35 +304,25 @@ def _dedupe(points: List[np.ndarray], tol: float = 1e-9) -> List[np.ndarray]:
 
 
 def _already_tried(w: np.ndarray, tried: List[np.ndarray], angle_tol: float = 1e-3) -> bool:
-    """True if w is within angle_tol (cosine) of a normal we've already shot."""
+    """Report whether a direction has effectively been shot already.
+
+    Parameters
+    ----------
+    w : numpy.ndarray
+        Shape ``(2,)``. Candidate unit direction.
+    tried : list of numpy.ndarray
+        Unit directions already shot.
+    angle_tol : float, default 1e-3
+        COSINE tolerance despite the name: `w` counts as already tried when
+        ``w . t > 1 - angle_tol`` for some `t`, i.e. within about 0.045 rad (2.6
+        degrees) of it at the default value.
+
+    Returns
+    -------
+    bool
+        True if `w` matches a previously shot direction that closely.
+    """
     for t in tried:
         if np.dot(w, t) > 1.0 - angle_tol:
             return True
     return False
-
-
-if __name__ == "__main__":
-    import logging, warnings
-    logging.getLogger("linopy").setLevel(logging.WARNING)
-    logging.getLogger("pypsa").setLevel(logging.WARNING)
-    warnings.filterwarnings("ignore", category=UserWarning, module="linopy")
-
-    from mga_engine.network import build_network
-    from mga_engine.poi import make_poi_specs, evaluate_all
-
-    network = build_network()
-    network.optimize(solver_name="highs", include_objective_constant=False,
-                     solver_options={"output_flag": False})
-    opt_cost = network.objective
-    poi_specs = make_poi_specs(network)
-
-    network_proj = build_network()
-    poi_specs_proj = make_poi_specs(network_proj)
-
-    hull = project_hull(
-        network_proj, poi_specs_proj, opt_cost,
-        epsilon=0.05, i=0, j=1,
-    )
-
-    print("\nHull vertices (PoI_0, PoI_1):")
-    print(np.round(hull, 3))

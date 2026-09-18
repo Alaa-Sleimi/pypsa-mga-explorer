@@ -1,33 +1,13 @@
-"""
-navigation.py — Navigation Algorithm (Algorithm 1 from Sina's paper).
+"""Navigation: turn a user's preference into the weights of a target solution.
 
-Given the current solution weights alpha_s and user preferences
-(priority order tau, direction sets SE/SG/SL, magnitude delta),
-finds the target weights alpha_t representing the new solution.
+Second step of the exploration phase (Algorithm 1). Given the current solution's
+weights alpha_s and a preference over the APoIs - a priority order, which ones to
+increase, decrease or hold, and by how much - it returns the weights alpha_t of the
+solution to move to, which :mod:`mga_engine.traverse` then walks towards. Everything
+happens as small LPs over the stored samples; the network is never touched.
 
-APoI index convention:
-    0        = cost (objective function value)
-    1, 2, .. = PoI values (e.g. solar=1, wind=2)
-
-Inputs:
-    P_all   : np.ndarray, shape (m, n)   — PoI sample matrix
-    v       : np.ndarray, shape (n,)     — min cost at each sample
-    alpha_s : np.ndarray, shape (n,)     — current solution weights
-    tau     : list[int]                  — priority order over APoI indices
-    SG      : set[int]                   — APoI indices to increase
-    SL      : set[int]                   — APoI indices to decrease
-    SE      : set[int]                   — APoI indices to keep equal
-    delta   : np.ndarray, shape (m+1,)  — desired magnitude per APoI index
-
-Outputs:
-    alpha_t : np.ndarray, shape (n,)     — target solution weights
-    SG_out  : set[int]                   — updated direction sets (feedback)
-    SL_out  : set[int]
-    SE_out  : set[int]
-    delta_out : np.ndarray               — updated magnitudes (feedback)
-    loop1_bounds : list[tuple]           — per-APoI interval bounds fixed by the
-                   first (feasibility) loop, as (apoi_index, lower, upper) with
-                   None where unbounded; APoIs in no direction set get no entry
+APoI index convention, also used by :mod:`mga_engine.alpha_projection`: index 0 is
+the cost, indices 1..m are the PoI values in P_all row order.
 """
 
 import numpy as np
@@ -52,27 +32,70 @@ def navigate(
     SE: set,
     delta: np.ndarray,
 ) -> Tuple[np.ndarray, set, set, set, np.ndarray, list]:
-    """Compute target solution weights from current weights and user preferences.
+    """Compute target solution weights from the current ones and a user preference.
+
+    Algorithm 1, in three stages over the priority order `tau`. Loop 1 checks each
+    APoI's requested direction against what the sample set actually allows, shrinks
+    `delta` to the achievable amount (or flips the APoI into SE when its requested
+    direction is impossible), and constrains it to the resulting interval. Loop 2
+    then pushes each APoI as far in its direction as the constraints accumulated so
+    far permit and locks the achieved value in. A final LP minimises cost subject to
+    all of them, so a preference that leaves room is spent on the cheapest solution
+    satisfying it.
 
     Parameters
     ----------
-    P_all   : np.ndarray, shape (m, n)  — PoI sample matrix
-    v       : np.ndarray, shape (n,)    — min cost at each sample
-    alpha_s : np.ndarray, shape (n,)    — current solution weights
-    tau     : list[int]                 — priority order over APoI indices
-    SG      : set[int]                  — APoI indices to increase
-    SL      : set[int]                  — APoI indices to decrease
-    SE      : set[int]                  — APoI indices to keep equal
-    delta   : np.ndarray, shape (m+1,)  — desired magnitude per APoI index
+    P_all : numpy.ndarray
+        Shape ``(m, n)``. Sample matrix, one PoI point in GW per column.
+    v : numpy.ndarray
+        Shape ``(n,)``. Minimum cost at each sample, in EUR/yr; APoI row 0.
+    alpha_s : numpy.ndarray
+        Shape ``(n,)``. Weights of the current solution. Expected to be on the
+        simplex (non-negative, summing to 1); this is not validated.
+    tau : list of int
+        APoI indices in priority order, most important first. An index in none of
+        `SG`, `SL`, `SE` is skipped by both loops.
+    SG, SL, SE : set of int
+        APoI indices to increase, to decrease, and to hold at their current value.
+        Expected to be disjoint; this is not validated.
+    delta : numpy.ndarray
+        Shape ``(m + 1,)``. Desired change per APoI index, as an absolute amount in
+        that APoI's own unit: EUR/yr for index 0, GW for the PoIs. Must be an array,
+        since ``.copy()`` is called on it.
 
     Returns
     -------
-    (alpha_t, SG_out, SL_out, SE_out, delta_out, loop1_bounds) :
-        alpha_t      : np.ndarray, shape (n,) — target solution weights
-        SG_out, SL_out, SE_out : set[int]     — updated direction sets (feedback)
-        delta_out    : np.ndarray             — updated magnitudes (feedback)
-        loop1_bounds : list[tuple]            — (apoi_index, lower, upper) per
-                       APoI in a direction set, None where unbounded
+    alpha_t : numpy.ndarray
+        Shape ``(n,)``. Weights of the target solution.
+    SG_out, SL_out, SE_out : set of int
+        The direction sets after Loop 1's feasibility flips, so the caller can show
+        which requests survived.
+    delta_out : numpy.ndarray
+        Shape ``(m + 1,)``. `delta` reduced to the magnitudes actually achievable.
+    loop1_bounds : list of tuple
+        One ``(apoi_index, lower, upper)`` per `tau` entry that ended up in a
+        direction set, with ``None`` on an unbounded side: the interval Loop 1 fixed
+        for that APoI. Accepted directly as the ``bounds`` argument of
+        :func:`mga_engine.alpha_projection.compute_alpha_hull_2d`.
+
+    Raises
+    ------
+    RuntimeError
+        If an LP in Loop 1 or the final solve fails, e.g. because the requested
+        preferences together are infeasible over the samples.
+
+    Notes
+    -----
+    `SG`, `SL`, `SE` and `delta` are copied before use, so the caller's objects are
+    never mutated; the returned ones are the updated copies.
+    A Loop-2 LP that fails is caught, reported with a printed warning and skipped:
+    that APoI then keeps the interval Loop 1 gave it instead of a locked value, and
+    the call still returns normally.
+    Loop 2 locks each achieved value into a window of ``LOCK_IN_TOL``, which leaves
+    `alpha_t` marginally off the exact hull boundary; see that constant's comment,
+    since :mod:`mga_engine.surrogate` is calibrated against it.
+    Roughly ``2 * len(tau) + 1`` SciPy LPs, more where SE is involved. No network and
+    no file access.
     """
     m, n = P_all.shape
 
@@ -102,7 +125,26 @@ def navigate(
     b_eq_base = np.array([1.0])
 
     def solve_ncp(c_obj):
-        """Solve NCP with current constraints and objective c_obj."""
+        """Solve the NCP with the constraints accumulated so far.
+
+        Parameters
+        ----------
+        c_obj : numpy.ndarray
+            Shape ``(n,)``. Linear objective over the weights. Pass a negated
+            P_tilde row to maximise that APoI instead of minimising it.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape ``(n,)``. Optimal weights: non-negative, summing to 1, and
+            satisfying every row added by `add_ineq` so far.
+
+        Raises
+        ------
+        RuntimeError
+            If SciPy's status is not 0, i.e. infeasible, unbounded, or a solver
+            failure.
+        """
         A_ub = np.array(A_ub_rows).reshape(-1, n) if A_ub_rows else None
         b_ub = np.array(b_ub_rows) if b_ub_rows else None
         bounds = [(0.0, None)] * n
@@ -120,15 +162,52 @@ def navigate(
         return result.x
 
     def add_ineq(row, rhs):
-        """AddConst: add one row to the inequality system."""
+        """AddConst: append one row ``row @ alpha <= rhs`` to the NCP.
+
+        Parameters
+        ----------
+        row : numpy.ndarray
+            Shape ``(n,)``. Coefficients over the weights. Negate both `row` and
+            `rhs` to express a lower bound.
+        rhs : float
+            Right-hand side, in the unit of the APoI the row came from.
+
+        Returns
+        -------
+        None
+            Appends to the enclosing ``A_ub_rows`` and ``b_ub_rows``, so every later
+            solve in this call carries the new row.
+        """
         A_ub_rows.append(row)
         b_ub_rows.append(rhs)
 
     def solve_ncp_absdev(row, ref):
-        """Solve NCP with objective min |row @ alpha - ref| (paper Algorithm 1,
-        SE case), linearized with one auxiliary variable t >= 0 and
-        t >= row @ alpha - ref, t >= ref - row @ alpha.
-        Returns (alpha, achieved deviation t)."""
+        """Solve the NCP minimising the absolute deviation ``|row @ alpha - ref|``.
+
+        The SE case of Algorithm 1, linearised with one auxiliary variable ``t >= 0``
+        bounded by ``t >= row @ alpha - ref`` and ``t >= ref - row @ alpha``, so that
+        minimising t minimises the deviation.
+
+        Parameters
+        ----------
+        row : numpy.ndarray
+            Shape ``(n,)``. The APoI row to hold near `ref`.
+        ref : float
+            Value to stay as close to as possible, in that APoI's unit.
+
+        Returns
+        -------
+        alpha : numpy.ndarray
+            Shape ``(n,)``. Optimal weights, with the auxiliary variable dropped.
+        deviation : float
+            The achieved ``t``, i.e. the smallest reachable
+            ``|row @ alpha - ref|``. Zero when the value can be held exactly.
+
+        Raises
+        ------
+        RuntimeError
+            If SciPy's status is not 0.
+        """
         n_rows = len(A_ub_rows)
         A_ub_alpha = np.array(A_ub_rows).reshape(n_rows, n)
         A_ub = np.vstack([
@@ -170,7 +249,7 @@ def navigate(
                 # Feasible decrease exists
                 delta[i] = min(ps_i - val, delta[i])
             else:
-                # Cannot decrease — flip to SE
+                # Cannot decrease - flip to SE
                 delta[i] = val - ps_i
                 SL.discard(i)
                 SE.add(i)
@@ -182,7 +261,7 @@ def navigate(
                 # Feasible increase exists
                 delta[i] = min(val - ps_i, delta[i])
             else:
-                # Cannot increase — flip to SE
+                # Cannot increase - flip to SE
                 delta[i] = ps_i - val
                 SG.discard(i)
                 SE.add(i)
@@ -208,7 +287,7 @@ def navigate(
         elif i in SG:
             loop1_bounds.append((i, ps_i + float(delta[i]), None))
 
-     # --- Loop 2: Improvement — push each priority as far as possible
+     # --- Loop 2: Improvement - push each priority as far as possible
     for i in tau:
         row_i = P_tilde[i]
         ps_i  = p_tilde_s[i]

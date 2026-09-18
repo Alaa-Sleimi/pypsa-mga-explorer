@@ -1,10 +1,15 @@
-"""
-preparation_state.py — Save and load the full preparation phase output.
+"""Run the preparation phase, and persist and verify its output.
 
-Saves everything needed for the exploration phase into a single .nc file
-using the netCDF4 library directly (no xarray). Writing the netCDF file
-without the xarray layer is faster on the large solution arrays produced
-by bigger models, which is what we benchmark on.
+Last module of the preparation phase and the first thing the exploration phase
+touches. :func:`run_preparation` orchestrates the whole heavy pipeline (base solve,
+vertex and interior sampling, GP pricing) and :func:`save` / :func:`load` move the
+result through a single netCDF4 file, so the many solves happen once per network
+rather than once per session. :func:`network_fingerprint` and :func:`check_state`
+then confirm that a cached file really belongs to the network, PoI definitions and
+epsilon in front of it.
+
+netCDF4 is used directly rather than through xarray, which is faster on the large
+per-sample solution arrays that bigger models produce.
 
 The file contains:
     - P_all   : (poi, sample)            all sample points
@@ -50,7 +55,7 @@ from netCDF4 import Dataset
 
 
 # ---------------------------------------------------------------------------
-# Network fingerprint — a cheap, solver-free structural hash used to detect a
+# Network fingerprint - a cheap, solver-free structural hash used to detect a
 # preparation state loaded against the wrong network / PoIs / epsilon.
 # ---------------------------------------------------------------------------
 
@@ -92,10 +97,28 @@ _TS_ATTRS = {
 
 
 def _num(x, sig: int = 6):
-    """Round a float to `sig` significant figures; non-finite -> stable sentinel.
+    """Round a float to `sig` significant figures; non-finite values to a sentinel.
 
-    Significant-figure rounding keeps the fingerprint stable across float-repr
-    noise while still catching real changes in capacities/costs at any scale.
+    Parameters
+    ----------
+    x : object
+        Value to canonicalise. Anything that does not convert to float is returned
+        as ``str(x)``.
+    sig : int, default 6
+        Significant figures to keep.
+
+    Returns
+    -------
+    float or str
+        The rounded float, ``0.0`` for zero with ``-0.0`` normalised away, or one of
+        the strings ``"nan"``, ``"inf"``, ``"-inf"``, ``str(x)``.
+
+    Notes
+    -----
+    Significant-figure rounding, rather than decimal rounding, keeps the fingerprint
+    stable against float-repr noise while still catching real changes in capacities
+    and costs at any magnitude. :func:`_timeseries_digest` instead rounds to 6
+    DECIMALS, so the two paths do not have the same sensitivity.
     """
     try:
         x = float(x)
@@ -112,7 +135,20 @@ def _num(x, sig: int = 6):
 
 
 def _cell(x):
-    """Canonicalise a single static-table cell to a JSON-stable primitive."""
+    """Canonicalise one static-table cell to a JSON-stable primitive.
+
+    Parameters
+    ----------
+    x : object
+        A single cell of a component's static frame.
+
+    Returns
+    -------
+    bool or str or float
+        Booleans (including ``numpy.bool_``) as ``bool`` and strings unchanged, so
+        that ``True`` and ``1.0`` cannot collide; anything else through
+        :func:`_num`.
+    """
     if isinstance(x, (bool, np.bool_)):
         return bool(x)
     if isinstance(x, str):
@@ -121,10 +157,35 @@ def _cell(x):
 
 
 def _timeseries_digest(df):
-    """Stable sha256 hex of a (rounded) time-varying frame, or None if empty.
+    """Stable sha256 of a rounded time-varying frame, or ``None`` if there is none.
 
-    Columns are sorted so column ordering can't change the digest; values are
-    rounded to 6 decimals and -0.0 normalised so float noise doesn't either.
+    Parameters
+    ----------
+    df : pandas.DataFrame or pandas.Series or None
+        A time-varying frame. A Series is widened to a one-column frame first.
+
+    Returns
+    -------
+    str or None
+        The hex digest over the sorted column names, the shape and the rounded
+        values; ``None`` for ``None``, for an empty frame, and for anything without
+        an ``empty`` attribute.
+
+    Raises
+    ------
+    ValueError
+        From the ``f8`` conversion if the frame holds non-numeric values.
+
+    Notes
+    -----
+    Columns are sorted before hashing so column ORDER cannot change the digest, and
+    values are rounded to 6 DECIMALS with ``-0.0`` normalised so float noise cannot
+    either. Decimal rounding means an absolute change below 5e-7 is invisible, which
+    differs from :func:`_num`'s significant-figure rounding; on a per-unit series
+    like ``p_max_pu`` that is a fine tolerance, on a large-magnitude series it is a
+    much looser one.
+    Columns are reindexed by their stringified names, so a frame with non-string
+    column labels would hash all-NaN columns instead of its values.
     """
     if df is None:
         return None
@@ -148,7 +209,43 @@ def _timeseries_digest(df):
 
 
 def _fingerprint_object(network, poi_definitions, epsilon) -> dict:
-    """Build the canonical (JSON-serialisable) structure that gets hashed."""
+    """Build the canonical, JSON-serialisable structure that gets hashed.
+
+    Parameters
+    ----------
+    network : pypsa.Network
+        Network to describe. Solved or unsolved: only input data is read.
+    poi_definitions : list of dict
+        PoI definitions in their intended order, as given to
+        :func:`mga_engine.poi.make_poi_specs`.
+    epsilon : float
+        Near-optimality slack the preparation runs at.
+
+    Returns
+    -------
+    dict
+        Keys ``"version"``, ``"epsilon"``, ``"n_snapshots"``,
+        ``"snapshot_weightings"`` (a digest), ``"components"`` (per component name,
+        ``{"cols", "rows"}`` plus ``"ts"`` when any time series is non-empty) and
+        ``"poi_definitions"`` (``[component, carriers, name, unit]`` per PoI).
+
+    Notes
+    -----
+    What enters, exactly: for each component whose name is a key of ``_STATIC_COLS``
+    and whose static frame is non-empty, the rows of the WHITELISTED columns only,
+    each row prefixed by the component's index name and the rows sorted so row order
+    cannot change the hash; plus a digest of each attribute in ``_TS_ATTRS`` for that
+    component. Everything else is omitted, including all ``*_opt`` result columns,
+    which is what makes the fingerprint solve-invariant.
+    Snapshots enter only as their COUNT plus a digest of the weightings, so replacing
+    the snapshot timestamps while keeping the count and weightings is invisible.
+    PoI order is preserved deliberately, since it fixes the row order of P_all, and
+    each PoI's carrier list is hashed in order too; ``json.dumps(sort_keys=True)``
+    sorts dict keys but never list entries. A PoI definition without ``"unit"``
+    hashes as ``"GW"``, matching the default in
+    :func:`mga_engine.poi.make_poi_specs`.
+    See :func:`network_fingerprint` for the consequences of what is left out.
+    """
     components = {}
     for component in network.components:
         cname = getattr(component, "name", None)
@@ -193,11 +290,58 @@ def _fingerprint_object(network, poi_definitions, epsilon) -> dict:
 
 
 def network_fingerprint(network, poi_definitions, epsilon) -> str:
-    """Return a sha256 hex fingerprint of the network structure, PoI definitions
-    (in order) and epsilon.
+    """Return a sha256 fingerprint of a WHITELISTED part of the network setup.
 
-    Pure and cheap: reads only pre-solve metadata (no ``optimize`` call, no
-    ``*_opt`` result columns), so it is deterministic and solve-invariant.
+    Parameters
+    ----------
+    network : pypsa.Network
+        Network to fingerprint. Solved or unsolved: only input data is read.
+    poi_definitions : list of dict
+        PoI definitions in their intended order, as given to
+        :func:`mga_engine.poi.make_poi_specs`.
+    epsilon : float
+        Near-optimality slack; a different epsilon gives a different fingerprint.
+
+    Returns
+    -------
+    str
+        64-character sha256 hex digest of :func:`_fingerprint_object`, serialised
+        with sorted dict keys and no whitespace.
+
+    Notes
+    -----
+    Pure and cheap: no ``optimize`` call and no ``*_opt`` column is read, so the
+    digest is deterministic, solve-invariant and independent of platform and solver.
+
+    COVERED: epsilon; the snapshot count and a digest of the snapshot weightings; the
+    ordered PoI definitions; and, for Bus, Generator, Line, Load, StorageUnit, Store,
+    Link and GlobalConstraint only, the columns listed in ``_STATIC_COLS`` and the
+    time series listed in ``_TS_ATTRS``.
+
+    NOT COVERED, so a change to any of these leaves the digest identical and a stale
+    cached state is silently reused (each of these was checked against the code):
+
+    - Whole components: ``Carrier`` (so ``co2_emissions`` is invisible),
+      ``Transformer``, ``ShuntImpedance``, and every other component absent from
+      ``_STATIC_COLS``.
+    - StorageUnit: ``cyclic_state_of_charge``, ``state_of_charge_initial``,
+      ``sign``, and the time-varying ``standing_loss`` and ``marginal_cost``.
+    - Store: ``e_cyclic``, ``e_initial``, ``sign``, and the time-varying
+      ``standing_loss`` and ``marginal_cost``.
+    - Link: any bus beyond ``bus0``/``bus1``, i.e. the extra legs and efficiencies
+      (``bus2``, ``efficiency2``, ...) of a multi-output link, plus its time-varying
+      ``efficiency`` and ``marginal_cost``.
+    - Generator: ``committable``, the ramp limits, ``start_up_cost`` /
+      ``shut_down_cost``, ``e_sum_min`` / ``e_sum_max``, ``build_year`` /
+      ``lifetime`` / ``active``, and the time-varying ``efficiency`` and
+      ``marginal_cost``. Only the STATIC ``marginal_cost`` and ``efficiency``
+      columns are hashed.
+    - Line: the time-varying ``s_max_pu``.
+    - The snapshot timestamps themselves, as noted in :func:`_fingerprint_object`.
+
+    Time-varying ``marginal_cost`` is the sharpest of these: switching a generator
+    from a static cost to a time series, or editing that series, changes the optimum
+    while :func:`check_state` still reports PASS.
     """
     obj = _fingerprint_object(network, poi_definitions, epsilon)
     canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
@@ -205,8 +349,32 @@ def network_fingerprint(network, poi_definitions, epsilon) -> str:
 
 
 def fingerprint_summary(network, poi_definitions, epsilon) -> dict:
-    """Small, human-readable summary stored alongside the fingerprint, used to
-    explain *what* differs on a mismatch. Not the source of truth (the hash is)."""
+    """Build the small human-readable summary stored alongside the fingerprint.
+
+    Parameters
+    ----------
+    network : pypsa.Network
+        Network to summarise.
+    poi_definitions : list of dict
+        PoI definitions in their intended order.
+    epsilon : float
+        Near-optimality slack.
+
+    Returns
+    -------
+    dict
+        Keys ``n_buses``, ``n_generators``, ``n_lines``, ``n_loads``,
+        ``n_snapshots``, ``carriers`` (the sorted distinct GENERATOR carriers),
+        ``poi_names`` and ``epsilon``.
+
+    Notes
+    -----
+    Diagnostic only: the hash is the source of truth, and this exists so that
+    :func:`_summary_diff` can say WHAT differs on a mismatch. It is coarser than the
+    fingerprint in both directions: it counts no links, storage units or stores, and
+    lists carriers only for generators, so for a network whose difference lies
+    elsewhere the diff falls back to its generic "coarse summary matches" line.
+    """
     gens = network.generators
     carriers = sorted(map(str, gens["carrier"].unique().tolist())) if len(gens) else []
     return {
@@ -222,7 +390,30 @@ def fingerprint_summary(network, poi_definitions, epsilon) -> dict:
 
 
 def make_fingerprint(network, poi_definitions, epsilon) -> dict:
-    """Bundle the three fingerprint pieces to hand to save(fingerprint=...)."""
+    """Bundle the three fingerprint pieces to hand to ``save(fingerprint=...)``.
+
+    Parameters
+    ----------
+    network : pypsa.Network
+        Network the preparation was, or will be, run on.
+    poi_definitions : list of dict
+        PoI definitions in their intended order.
+    epsilon : float
+        Near-optimality slack the preparation runs at.
+
+    Returns
+    -------
+    dict
+        Keys ``"fingerprint"`` (the hex digest), ``"fingerprint_version"`` (the
+        current ``FINGERPRINT_VERSION``) and ``"fingerprint_summary"`` (the dict from
+        :func:`fingerprint_summary`).
+
+    Notes
+    -----
+    Must be called with the same network, PoI definitions and epsilon the samples
+    were actually produced with; nothing cross-checks that, so fingerprinting a
+    different setup would certify the wrong thing.
+    """
     return {
         "fingerprint": network_fingerprint(network, poi_definitions, epsilon),
         "fingerprint_version": FINGERPRINT_VERSION,
@@ -231,11 +422,31 @@ def make_fingerprint(network, poi_definitions, epsilon) -> dict:
 
 
 def _write_fingerprint_attrs(ds, fingerprint):
-    """Write the fingerprint bundle as GLOBAL ATTRIBUTES only.
+    """Write the fingerprint bundle onto an open dataset as GLOBAL ATTRIBUTES.
 
-    Never as variables: load() treats every non-reserved variable as a per-sample
-    solution key, so a fingerprint variable would corrupt solution reconstruction.
-    Accepts either the bundle dict from make_fingerprint() or a bare hash string.
+    Parameters
+    ----------
+    ds : netCDF4.Dataset
+        Dataset open for writing.
+    fingerprint : dict or str
+        The bundle from :func:`make_fingerprint`, or a bare hash string, which is
+        wrapped into a bundle carrying only the digest.
+
+    Returns
+    -------
+    None
+        Sets ``ds.fingerprint``, ``ds.fingerprint_version`` and, when a summary is
+        present, ``ds.fingerprint_summary`` as JSON with sorted keys. Returns
+        without writing anything if the bundle carries no digest.
+
+    Notes
+    -----
+    Global attributes, never variables: :func:`load` treats every variable other than
+    the four reserved ones as a per-sample solution key, so a fingerprint stored as a
+    variable would be reconstructed as bogus solution data.
+    A missing ``fingerprint_version`` in the bundle defaults to the CURRENT
+    ``FINGERPRINT_VERSION``, which would mislabel a digest computed under an older
+    scheme; :func:`make_fingerprint` always supplies it.
     """
     if isinstance(fingerprint, str):
         fingerprint = {"fingerprint": fingerprint}
@@ -250,7 +461,23 @@ def _write_fingerprint_attrs(ds, fingerprint):
 
 
 def _summary_diff(old: dict, new: dict) -> list:
-    """Human-readable lines describing how two fingerprint summaries differ."""
+    """Describe how two fingerprint summaries differ, one line per key.
+
+    Parameters
+    ----------
+    old : dict
+        The summary stored in the loaded state. A missing key reads as
+        ``"<missing>"``.
+    new : dict
+        The summary recomputed from the current setup.
+
+    Returns
+    -------
+    list of str
+        One indented line per differing key, over the fixed key list. When no key
+        differs, a single line saying the coarse summary matches while the detailed
+        fingerprint does not, which points at capacities, costs or time series.
+    """
     keys = ["n_buses", "n_generators", "n_lines", "n_loads", "n_snapshots",
             "carriers", "poi_names", "epsilon"]
     lines = []
@@ -270,28 +497,61 @@ def check_state(state, network, poi_definitions, requested_epsilon,
                 requested_n_samples_per_level=None):
     """Compare a loaded state's fingerprint against the current setup.
 
-    The network/PoI/epsilon fingerprint is always checked. The sampling
-    parameters (n_vertices, seed, n_samples_per_level) are additionally
-    compared against the current run's intended values ONLY when the caller
-    supplies them via the requested_* keyword arguments; each defaults to
-    None, meaning "don't check this one" (preserves prior behavior for
-    callers that omit them). The vertex-phase epsilon is already covered by
-    requested_epsilon via the network fingerprint.
+    The network / PoI / epsilon fingerprint is always checked. The sampling
+    parameters are compared as well, but only the ones the caller actually asks
+    about: each ``requested_*`` argument defaults to ``None``, meaning "do not check
+    this one".
+
+    Parameters
+    ----------
+    state : dict
+        A state as returned by :func:`load`. Only its metadata keys are read, never
+        the arrays.
+    network : pypsa.Network
+        The network the exploration is about to run against. Solved or unsolved:
+        only input data is read.
+    poi_definitions : list of dict
+        The current PoI definitions, in order, exactly as handed to
+        :func:`mga_engine.poi.make_poi_specs`. Order is part of the fingerprint.
+    requested_epsilon : float
+        The epsilon the current run intends to use. This also covers the
+        vertex-phase epsilon, since it enters the network fingerprint.
+    requested_n_vertices : int, optional
+        Vertex-sample count to compare against the stored one. ``None`` skips it.
+    requested_seed : int, optional
+        RNG seed to compare against the stored one. ``None`` skips it.
+    requested_n_samples_per_level : int, optional
+        Interior samples per level to compare against the stored one. ``None``
+        skips it.
 
     Returns
     -------
-    (status, message) where status is one of:
-        "PASS"       — fingerprint matches this network / PoIs / epsilon, and
-                       every requested sampling parameter that could be
-                       compared matches too
-        "MISMATCH"   — a real mismatch (network/PoI/epsilon, or a supplied
-                       sampling parameter); message diffs the summaries
-        "UNVERIFIED" — no/incomparable fingerprint (old file or version
-                       bump), or a requested sampling parameter's stored
-                       attribute is missing (older file predates it)
+    status : str
+        ``"PASS"`` when the fingerprint matches this network, these PoIs and this
+        epsilon, and every requested sampling parameter that could be compared
+        matches too. ``"MISMATCH"`` on a real difference, in the fingerprint or in a
+        supplied sampling parameter. ``"UNVERIFIED"`` when there is nothing
+        comparable: no stored fingerprint, a different ``FINGERPRINT_VERSION``, or a
+        requested sampling parameter the file predates.
+    message : str
+        Human-readable explanation. On a fingerprint mismatch it embeds the
+        :func:`_summary_diff` lines.
 
-    Pure and cheap — recomputes the current fingerprint (no solver calls) and
-    compares strings/values.
+    Notes
+    -----
+    Pure and cheap: recomputes the fingerprint (no solver call) and compares strings
+    and values. Nothing is raised on a mismatch and nothing is deleted; the caller
+    decides what a given status means, and the notebook turns ``"MISMATCH"`` into a
+    ``RuntimeError``.
+    The messages name the notebook's own controls ("set rerun_preparation = True and
+    re-run Section 3"), so they read oddly outside that notebook.
+    ``"PASS"`` is only as strong as the fingerprint: a network change outside the
+    whitelist in :func:`network_fingerprint` still passes, and a stale cached state
+    is then reused silently. ``n_interior_levels`` and ``epsilon_min`` are stored by
+    :func:`save` but cannot be checked here at all, so a caller that varies them has
+    to compare them itself.
+    A ``"MISMATCH"`` on the fingerprint short-circuits: the sampling parameters are
+    not examined, so its message names only the network-level difference.
     """
     stored = state.get("fingerprint")
     if stored is None:
@@ -361,12 +621,44 @@ def check_state(state, network, poi_definitions, requested_epsilon,
 # ---------------------------------------------------------------------------
 
 def _dim_name(key: str, axis: int) -> str:
-    """Per-key, per-axis dimension name. Sanitised to avoid odd characters."""
+    """Build the netCDF dimension name for one axis of one solution key.
+
+    Parameters
+    ----------
+    key : str
+        Solution key, e.g. ``"Generator_p_nom_opt"``.
+    axis : int
+        Index of the trailing axis, counted after the leading sample axis.
+
+    Returns
+    -------
+    str
+        ``"<key>__dim<axis>"``, with spaces in `key` replaced by underscores. Only
+        spaces are replaced; any other character a solution key may carry is passed
+        through to netCDF unchanged.
+    """
     safe = key.replace(" ", "_")
     return f"{safe}__dim{axis}"
 
 
 def _safe_remove(path: str):
+    """Delete a file if possible, ignoring the failure if it is not.
+
+    Parameters
+    ----------
+    path : str
+        File to remove.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Every ``OSError`` is swallowed, a missing file and a permission error alike.
+    Used only on :func:`save`'s error path, where the original exception is about to
+    be re-raised and must not be masked by a cleanup failure.
+    """
     try:
         os.remove(path)
     except OSError:
@@ -376,30 +668,65 @@ def _safe_remove(path: str):
 def save(path: str, P_all, v, Gamma, solutions, p_star, epsilon, poi_names,
          fingerprint=None, n_vertices=None, n_interior_levels=None,
          n_samples_per_level=None, epsilon_min=None, seed=None):
-    """
-    Save preparation phase output to a single .nc file using netCDF4 directly.
+    """Save the preparation phase output to one .nc file, written with netCDF4.
 
     Parameters
     ----------
-    path        : file path, e.g. "data/preparation_state.nc"
-    P_all       : np.ndarray (m, n)
-    v           : np.ndarray (n,)
-    Gamma       : np.ndarray (m, n)
-    solutions   : list of dicts — one dict per sample
-    p_star      : np.ndarray (m,)  PoI vector at the optimal point
-    epsilon     : float            near-optimality threshold used in preparation
-    poi_names   : list[str]        PoI name per row of P_all, in order (length m)
-    fingerprint : optional network fingerprint bundle from make_fingerprint()
-                  (or a bare hash string). When given, it is stored as global
-                  attributes; omitting it keeps existing callers unchanged.
-    n_vertices, n_interior_levels, n_samples_per_level, epsilon_min, seed :
-                  optional sampling parameters the preparation was run with.
-                  Each one given is stored as a global attribute so load()
-                  can hand it back for checking; omitted ones are not stored.
+    path : str
+        Destination, e.g. ``"data/preparation_state.nc"``. Missing parent
+        directories are created.
+    P_all : numpy.ndarray
+        Shape ``(m, n)``. Sample matrix, one PoI point in GW per column.
+    v : numpy.ndarray
+        Shape ``(n,)``. Minimum cost at each sample, in EUR/yr.
+    Gamma : numpy.ndarray
+        Shape ``(m, n)``. PoI duals per sample, in EUR/yr per GW.
+    solutions : list of dict
+        One :func:`mga_engine.gp_solver._extract_solution` dict per sample, in the
+        column order of `P_all`. All of them must share keys and per-key shapes.
+    p_star : numpy.ndarray
+        Shape ``(m,)``. PoI vector in GW at the cost optimum.
+    epsilon : float
+        Near-optimality slack the preparation ran at.
+    poi_names : list of str
+        PoI name per row of `P_all`, in order; length must equal ``m``.
+    fingerprint : dict or str, optional
+        The bundle from :func:`make_fingerprint`, or a bare hash string. Stored as
+        global attributes when given; omitting it simply writes an unverifiable file.
+    n_vertices, n_interior_levels, n_samples_per_level, seed : int, optional
+        Sampling parameters the preparation was run with.
+    epsilon_min : float, optional
+        Tightest interior level the preparation used.
 
+    Returns
+    -------
+    None
+        Writes the file and prints a confirmation line.
+
+    Raises
+    ------
+    AssertionError
+        If ``len(poi_names)`` does not equal `P_all`'s row count. A plain ``assert``,
+        so it vanishes under ``python -O``.
+    ValueError
+        If the solution dicts disagree on keys or on any key's shape, naming the
+        offending sample; also from the shape unpacking if `P_all` is not 2-D.
+    IndexError
+        If `solutions` is empty.
+
+    Notes
+    -----
+    Each optional sampling parameter is stored only if it is not ``None``, and
+    :func:`load` returns ``None`` for whatever is absent; that is also how
+    :func:`check_state` tells "not stored" from "does not match".
     The write is atomic: the file is built as ``path + ".tmp"`` and only
-    ``os.replace``-d into place after a clean close, so an interrupted save can
-    never truncate or corrupt the existing good .nc.
+    ``os.replace``-d into place after a clean close, so an interrupted save can never
+    truncate the existing good .nc. It does OVERWRITE any file already at `path`.
+    Everything is written as f8 and uncompressed, so integer and boolean solution
+    values come back as floats and the files are large: roughly 90 MiB for 230
+    samples of a 24-bus network.
+    ``poi_names`` round-trips as one newline-joined attribute, so a PoI name
+    containing a newline would split into two names on load.
     """
     dirpath = os.path.dirname(path)
     if dirpath:
@@ -493,20 +820,41 @@ def save(path: str, P_all, v, Gamma, solutions, p_star, epsilon, poi_names,
 
 
 def load(path: str) -> dict:
-    """
-    Load preparation phase output from a .nc file written by save().
+    """Load a preparation state from a .nc file written by :func:`save`.
+
+    Parameters
+    ----------
+    path : str
+        File to read.
 
     Returns
     -------
-    dict with keys: P_all, v, Gamma, p_star, epsilon, n_vertices,
-    n_interior_levels, n_samples_per_level, epsilon_min, seed, poi_names,
-    solutions, fingerprint, fingerprint_version, fingerprint_summary
+    dict
+        ``"P_all"`` ``(m, n)``, ``"v"`` ``(n,)``, ``"Gamma"`` ``(m, n)`` and
+        ``"p_star"`` ``(m,)`` as float arrays; ``"epsilon"``, ``"n_vertices"``,
+        ``"n_interior_levels"``, ``"n_samples_per_level"``, ``"epsilon_min"``,
+        ``"seed"``, ``"poi_names"``, ``"fingerprint"``, ``"fingerprint_version"``
+        and ``"fingerprint_summary"`` from the global attributes, each ``None`` when
+        the file predates it; and ``"solutions"``, a list of n dicts rebuilt one
+        sample at a time.
+
+    Raises
+    ------
+    OSError
+        From netCDF4 if `path` is missing or unreadable.
+    KeyError
+        If one of the four core variables, or the ``sample`` dimension, is absent.
 
     Notes
     -----
-    epsilon, poi_names and the three fingerprint fields are read from global
-    attributes. Files written before any of them were added will not have them;
-    in that case they are returned as None (backward compatible).
+    Every variable other than ``P_all``, ``v``, ``Gamma`` and ``p_star`` is treated
+    as a per-sample solution key, which is why :func:`_write_fingerprint_attrs`
+    stores the fingerprint as attributes and not as variables.
+    A ``fingerprint_summary`` that is not valid JSON becomes ``None`` silently, which
+    leaves :func:`check_state` able to compare the hash but unable to say what
+    differs.
+    All samples are read into memory at once, so peak memory is the whole file.
+    Prints a confirmation line.
     """
     ds = Dataset(path, mode="r")
     try:
@@ -581,31 +929,84 @@ def run_preparation(
     n_samples_per_level: int = 10,
     epsilon_min: float = 0.005,
 ):
-    """
-    Run the full preparation phase on an arbitrary network and return everything
-    save() needs. This is the heavy step (many solves) that produces a
-    preparation_state .nc — the exploration notebook calls this directly, so a
-    user never has to run a separate backend script.
+    """Run the whole preparation phase and return everything :func:`save` needs.
+
+    The heavy step: a base solve for c'x* and p*, vertex sampling at `epsilon`,
+    interior sampling down the derived epsilon levels, then one GP solve per sample.
+    The exploration notebook calls this directly, so a user never has to run a
+    separate backend script.
 
     Parameters
     ----------
-    build_network_fn  : callable returning a FRESH network. Called several times,
-                        since the sampling builds a new optimisation model each
-                        time it runs.
-    make_poi_specs_fn : callable taking a network -> list[PoiSpec]. Must produce
-                        the same PoIs, in the same order, you intend to explore.
-    epsilon           : near-optimality slack for the outer (vertex) boundary.
-    n_vertices        : number of vertex MP(r) samples.
-    seed              : RNG seed for vertex sampling; per-level interior seeds
-                        are derived from it via SeedSequence.spawn().
-    n_interior_levels : number of interior epsilon levels (derived from epsilon
-                        down to epsilon_min via derive_epsilon_levels).
-    n_samples_per_level : interior MP(r) samples per epsilon level.
-    epsilon_min       : smallest interior level; must be > 0 and < epsilon.
+    build_network_fn : callable
+        ``build_network_fn() -> pypsa.Network``, returning a FRESH network each time.
+        Called ``2 + n_interior_levels + 1`` times, because each sampling stage
+        builds its own optimisation model.
+    make_poi_specs_fn : callable
+        ``make_poi_specs_fn(network) -> list of PoiSpec``. Must produce the same
+        PoIs, in the same order, on every call; that order fixes the rows of `P_all`.
+    epsilon : float, default 0.05
+        Relative cost slack for the outer (vertex) boundary.
+    n_vertices : int, default 30
+        Number of vertex MP(r) samples.
+    seed : int, default 42
+        RNG seed. Used directly for the vertex sampling, and the per-level interior
+        seeds are derived from it with ``SeedSequence.spawn()``, so one seed makes
+        the whole sample set reproducible.
+    n_interior_levels : int, default 5
+        Number of interior epsilon levels, derived from `epsilon` down to
+        `epsilon_min` by :func:`mga_engine.interior_sampling.derive_epsilon_levels`.
+    n_samples_per_level : int, default 10
+        Interior MP(r) samples per level.
+    epsilon_min : float, default 0.005
+        Tightest interior level. Must satisfy ``0 < epsilon_min < epsilon``.
 
     Returns
     -------
-    (P_all, v, Gamma, solutions, p_star, poi_names) — feed straight into save().
+    P_all : numpy.ndarray
+        Shape ``(m, n_vertices + n_interior_levels * n_samples_per_level)``. The
+        vertex samples first, then the interior ones, in level order.
+    v : numpy.ndarray
+        Shape ``(n,)``. Minimum cost at each sample, in EUR/yr.
+    Gamma : numpy.ndarray
+        Shape ``(m, n)``. PoI duals per sample, in EUR/yr per GW.
+    solutions : list of dict
+        One full solution dict per sample, in column order.
+    p_star : numpy.ndarray
+        Shape ``(m,)``. PoI vector in GW at the cost optimum.
+    poi_names : list of str
+        PoI name per row of `P_all`, from the specs built on the base network.
+
+    Raises
+    ------
+    AssertionError
+        From :func:`mga_engine.interior_sampling.derive_epsilon_levels` if the
+        epsilon levels are not well formed.
+    RuntimeError
+        From the first failed MP(r) or GP solve. The run aborts with no partial
+        result, after however many solves already succeeded.
+    ValueError
+        From :func:`mga_engine.poi.make_poi_specs` if a PoI definition does not match
+        the network.
+
+    Notes
+    -----
+    The six return values feed straight into :func:`save`; ``opt_cost`` is NOT among
+    them and is not saved, so a caller that needs c'x* has to recompute it.
+    The base ``optimize`` call's status is not checked, so an infeasible or
+    unbounded base network yields a meaningless `opt_cost` and the sampling proceeds
+    from it rather than failing here.
+    One base solve plus ``n_vertices + n_interior_levels * n_samples_per_level``
+    MP(r) solves and the same number of GP solves; for the defaults that is
+    1 + 80 + 80. Many prints, no file I/O.
+    The four pipeline modules, :func:`mga_engine.gp_solver.solve_all_gp` among them,
+    are imported inside this function rather than at module scope. The measured
+    effect is that importing this module pulls in neither pypsa nor linopy: the
+    state-loading path, :func:`load` and :func:`check_state`, stays free of the
+    sampling stack. There is no circular import between these modules that would
+    force it.
+    TODO(alaa): was avoiding the pypsa/linopy import cost on the load-only path the
+    actual reason for the lazy imports, or was there another one worth recording?
     """
     from mga_engine.poi import evaluate_all
     from mga_engine.vertex_sampling import sample_vertices
@@ -639,57 +1040,3 @@ def run_preparation(
 
     poi_names = [s.name for s in poi_specs]
     return P_all, v, Gamma, solutions, p_star, poi_names
-
-
-if __name__ == "__main__":
-    import logging, warnings
-    logging.getLogger("linopy").setLevel(logging.WARNING)
-    logging.getLogger("pypsa").setLevel(logging.WARNING)
-    warnings.filterwarnings("ignore", category=UserWarning, module="linopy")
-
-    from mga_engine.network import build_network
-    from mga_engine.poi import make_poi_specs, POI_DEFINITIONS
-
-    EPSILON = 0.05
-    N_VERTICES = 30
-    N_INTERIOR_LEVELS = 5
-    N_SAMPLES_PER_LEVEL = 10
-    EPSILON_MIN = 0.005
-
-    # Full preparation pipeline on the example network (same call the notebook makes)
-    P_all, v, Gamma, solutions, p_star, poi_names = run_preparation(
-        build_network, make_poi_specs, epsilon=EPSILON, n_vertices=N_VERTICES,
-        n_interior_levels=N_INTERIOR_LEVELS, n_samples_per_level=N_SAMPLES_PER_LEVEL,
-        epsilon_min=EPSILON_MIN,
-    )
-
-    # --- fingerprint (cheap, no solve): a fresh unsolved network is enough ---
-    fingerprint = make_fingerprint(build_network(), POI_DEFINITIONS, EPSILON)
-
-    # --- save ---
-    save("data/preparation_state.nc", P_all, v, Gamma, solutions, p_star, EPSILON,
-         poi_names, fingerprint=fingerprint, n_vertices=N_VERTICES,
-         n_interior_levels=N_INTERIOR_LEVELS, n_samples_per_level=N_SAMPLES_PER_LEVEL,
-         epsilon_min=EPSILON_MIN)
-
-    # --- reload and verify ---
-    state = load("data/preparation_state.nc")
-    assert np.allclose(state["P_all"], P_all),         "P_all mismatch!"
-    assert np.allclose(state["v"], v),                 "v mismatch!"
-    assert np.allclose(state["Gamma"], Gamma),         "Gamma mismatch!"
-    assert np.allclose(state["p_star"], p_star),       "p_star mismatch!"
-    assert state["poi_names"] == poi_names,            "poi_names mismatch!"
-    assert state["epsilon"] == EPSILON,                "epsilon mismatch!"
-    assert len(state["solutions"]) == len(solutions),  "solutions length mismatch!"
-    assert state["fingerprint"] == fingerprint["fingerprint"], "fingerprint mismatch!"
-
-    status, message = check_state(state, build_network(), POI_DEFINITIONS, EPSILON)
-    assert status == "PASS", f"check_state expected PASS, got {status}: {message}"
-
-    print("[state] Verification passed — save/load is consistent.")
-    print(f"[state] epsilon = {state['epsilon']}")
-    print(f"[state] poi_names = {state['poi_names']}")
-    print(f"[state] fingerprint = {state['fingerprint'][:16]}…  (v{state['fingerprint_version']})")
-    print(f"[state] check_state: {status} — {message}")
-    print(f"[state] p_star = {p_star}")
-    print(f"[state] Keys in first loaded solution: {list(state['solutions'][0].keys())}")

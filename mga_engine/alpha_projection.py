@@ -1,22 +1,14 @@
-"""
-alpha_projection.py — Adaptive 2D projection of the SAMPLED near-optimal space.
+"""2-D projection of the SAMPLED near-optimal space, in weight space.
 
-Unlike projection.py (which solves MP(r) on the live network and yields the
-true LP boundary), this module works entirely in alpha space: the region is
-conv(columns of P_tilde) — the convex hull of the stored samples, i.e. the
-space the navigation algorithm (navigation.py) actually searches — optionally
-intersected with per-APoI interval bounds (the loop-1 bounds navigate()
-returns). Each direction solve is a small scipy linprog over the weights
-alpha; no PyPSA/Linopy model is involved.
+Exploration-phase plotting support. Where :mod:`mga_engine.projection` solves MP(r) on
+a live network and returns the true LP boundary, this module stays in alpha space:
+the region is the convex hull of the stored samples, which is what
+:mod:`mga_engine.navigation` actually searches, optionally intersected with the
+per-APoI interval bounds navigate() reports. Every direction solve is one small SciPy
+LP over the weights, so a plot costs milliseconds and needs no PyPSA or linopy model.
 
-Directions are chosen with the same adaptive edge-normal refinement scheme as
-projection.py: seed with 4 axis-aligned directions, build the 2D convex hull,
-push outward along each edge normal, and stop when no push improves the hull
-by more than a relative threshold (or the iteration cap is reached).
-
-APoI index convention (as in navigation.py):
-    0        = cost (row 0 of P_tilde = v)
-    1, 2, .. = PoI values
+APoI index convention, as in :mod:`mga_engine.navigation`: index 0 is the cost (row 0
+of P_tilde is v), indices 1..m are the PoI values.
 """
 
 import numpy as np
@@ -26,7 +18,33 @@ from typing import List, Optional, Tuple
 
 
 def _bounds_matrix(P_tilde: np.ndarray, bounds) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """Turn (apoi_index, lower, upper) bounds into linprog A_ub / b_ub rows."""
+    """Turn ``(apoi_index, lower, upper)`` bounds into linprog ``A_ub`` / ``b_ub`` rows.
+
+    Parameters
+    ----------
+    P_tilde : numpy.ndarray
+        Shape ``(m + 1, n)``. APoI matrix ``[v'; P_all]``; row `k` of a bound entry
+        supplies that APoI's coefficients over the weights.
+    bounds : list of tuple or None
+        Entries ``(apoi_index, lower, upper)`` with ``None`` on an unbounded side,
+        the format :func:`mga_engine.navigation.navigate` returns as
+        ``loop1_bounds``.
+
+    Returns
+    -------
+    A_ub : numpy.ndarray or None
+        Shape ``(rows, n)``. One row per finite side: ``row @ alpha <= upper`` for an
+        upper bound, the negated row for a lower bound.
+    b_ub : numpy.ndarray or None
+        Shape ``(rows,)``. The matching right-hand sides.
+
+    Notes
+    -----
+    Returns ``(None, None)`` when `bounds` is ``None`` or empty, and also when every
+    entry has ``None`` on both sides, which linprog reads as no inequality system at
+    all. Bounds are not validated: a lower above its upper simply yields an
+    infeasible LP, which the callers report as a failed direction.
+    """
     if not bounds:
         return None, None
     A, b = [], []
@@ -50,11 +68,33 @@ def _solve_direction_2d(
     A_ub: Optional[np.ndarray],
     b_ub: Optional[np.ndarray],
 ) -> Optional[np.ndarray]:
-    """
-    Maximize  w[0] * row_i·alpha + w[1] * row_j·alpha  over alpha in the simplex
-    (intersected with the extra A_ub/b_ub bounds), i.e. minimize the negation.
+    """Maximise ``w[0] * row_i . alpha + w[1] * row_j . alpha`` over the simplex.
 
-    Returns the 2D point (row_i·alpha, row_j·alpha), or None if the solve failed.
+    Parameters
+    ----------
+    row_i, row_j : numpy.ndarray
+        Shape ``(n,)``. The two APoI rows spanning the plane. Either the raw rows of
+        P_tilde or rows already divided by an axis scale; the returned point is in
+        whatever units these carry.
+    w : numpy.ndarray
+        Shape ``(2,)``. In-plane direction to maximise along. linprog minimises, so
+        the objective handed to it is the negated combination.
+    A_ub, b_ub : numpy.ndarray or None
+        Extra inequality rows over the weights from :func:`_bounds_matrix`, or
+        ``None`` for the unrestricted hull.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        Shape ``(2,)``. The point ``(row_i . alpha, row_j . alpha)`` at the optimum,
+        or ``None`` if the LP did not solve to optimality.
+
+    Notes
+    -----
+    The weights are constrained to the simplex (non-negative, summing to 1) in
+    addition to `A_ub`. Any non-zero SciPy status, infeasible and unbounded alike,
+    collapses to ``None``, so the caller cannot tell which occurred.
+    One SciPy/HiGHS LP; deterministic; no network access.
     """
     n = row_i.shape[0]
     c = -(float(w[0]) * row_i + float(w[1]) * row_j)
@@ -73,13 +113,48 @@ def _solve_direction_2d(
 
 
 def _ccw_hull_vertices(pts: np.ndarray) -> np.ndarray:
-    """Convex hull vertices of 2D points in CCW order (scipy is CCW for 2D)."""
+    """Convex hull of 2-D points, as vertices in counter-clockwise order.
+
+    Parameters
+    ----------
+    pts : numpy.ndarray
+        Shape ``(k, 2)``. Points to hull.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(h, 2)``. Hull vertices; SciPy reports them CCW for 2-D input.
+
+    Raises
+    ------
+    scipy.spatial.QhullError
+        If fewer than 3 points are given, or they are collinear. Unlike in
+        :mod:`mga_engine.projection`, both callers here catch this and fall back to
+        a degenerate result.
+    """
     hull = ConvexHull(pts)
     return pts[hull.vertices]
 
 
 def _outward_edge_normals(points_ccw: np.ndarray) -> List[np.ndarray]:
-    """Outward unit normal of each edge of a CCW polygon: (dx,dy) -> (dy,-dx)."""
+    """Return the outward unit normal of every edge of a CCW polygon.
+
+    Parameters
+    ----------
+    points_ccw : numpy.ndarray
+        Shape ``(k, 2)``. Hull vertices in counter-clockwise order.
+
+    Returns
+    -------
+    list of numpy.ndarray
+        One unit vector of shape ``(2,)`` per edge, in edge order: edge ``(dx, dy)``
+        gives ``(dy, -dx)`` normalised. Zero-length edges are skipped.
+
+    Notes
+    -----
+    Orientation is assumed, not checked: clockwise input yields inward normals.
+    Duplicated from :func:`mga_engine.projection._outward_edge_normals`.
+    """
     normals = []
     n = len(points_ccw)
     for k in range(n):
@@ -92,7 +167,27 @@ def _outward_edge_normals(points_ccw: np.ndarray) -> List[np.ndarray]:
 
 
 def _already_tried(w: np.ndarray, tried: List[np.ndarray], angle_tol: float = 1e-3) -> bool:
-    """True if w is within angle_tol (cosine) of a normal already shot."""
+    """Report whether a direction has effectively been shot already.
+
+    Parameters
+    ----------
+    w : numpy.ndarray
+        Shape ``(2,)``. Candidate unit direction.
+    tried : list of numpy.ndarray
+        Unit directions already shot.
+    angle_tol : float, default 1e-3
+        COSINE tolerance despite the name: `w` counts as tried when ``w . t > 1 -
+        angle_tol`` for some `t`, about 0.045 rad (2.6 degrees) at the default.
+
+    Returns
+    -------
+    bool
+        True if `w` matches a previously shot direction that closely.
+
+    Notes
+    -----
+    Duplicated from :func:`mga_engine.projection._already_tried`.
+    """
     for t in tried:
         if np.dot(w, t) > 1.0 - angle_tol:
             return True
@@ -100,7 +195,27 @@ def _already_tried(w: np.ndarray, tried: List[np.ndarray], angle_tol: float = 1e
 
 
 def _dedupe(pts: np.ndarray, tol: float) -> np.ndarray:
-    """Remove duplicate 2D points (within Euclidean tol)."""
+    """Drop 2-D points that duplicate an earlier one within a Euclidean tolerance.
+
+    Parameters
+    ----------
+    pts : numpy.ndarray
+        Shape ``(k, 2)``. Points in the order they were found.
+    tol : float
+        Absolute Euclidean tolerance. Required here, unlike
+        :func:`mga_engine.projection._dedupe`, because the caller sizes it to the
+        data; the points reaching this function are already axis-scaled.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(h, 2)``. The first occurrence of each distinct point, in input
+        order. An empty input yields an array of shape ``(0,)``, not ``(0, 2)``.
+
+    Notes
+    -----
+    Quadratic in the number of survivors.
+    """
     out = []
     for p in pts:
         if not any(np.linalg.norm(p - q) < tol for q in out):
@@ -109,12 +224,32 @@ def _dedupe(pts: np.ndarray, tol: float) -> np.ndarray:
 
 
 def _classify(pts: np.ndarray, scale: float) -> Tuple[np.ndarray, str]:
-    """
-    Turn the collected boundary points into the final result:
-      ("polygon", CCW hull vertices)  — the generic case
-      ("segment", 2 endpoints)        — points (near-)collinear
-      ("point",   1 point)            — everything coincides
-    Never raises QhullError: degenerate regions fall back gracefully.
+    """Turn the collected boundary points into the final region, however degenerate.
+
+    Parameters
+    ----------
+    pts : numpy.ndarray
+        Shape ``(k, 2)``. Collected boundary points, in SCALED coordinates.
+    scale : float
+        Characteristic size of the point cloud, used to size the dedupe tolerance
+        as ``max(1e-12, 1e-9 * scale)``.
+
+    Returns
+    -------
+    points : numpy.ndarray
+        Shape ``(h, 2)``: the CCW hull vertices, the two extreme points, or the
+        single surviving point, matching `kind`.
+    kind : str
+        ``"polygon"`` in the generic case, ``"segment"`` when the points are
+        (near-)collinear, ``"point"`` when they all coincide.
+
+    Notes
+    -----
+    Collinearity is decided by an SVD of the centred points: the region is a segment
+    when the second singular value is at most ``1e-6`` times the first, and the two
+    endpoints are then the extremes along the first principal direction.
+    Never raises ``QhullError``: a hull failure falls back to the same segment, so a
+    genuinely 1-D or 0-D region is reported rather than crashing the caller.
     """
     distinct = _dedupe(pts, tol=max(1e-12, 1e-9 * scale))
     if len(distinct) == 1:
@@ -142,27 +277,59 @@ def compute_alpha_hull_2d(
     max_iterations: int = 50,
     min_improvement: float = 1e-6,
 ) -> Tuple[np.ndarray, str]:
-    """
-    Compute the 2D boundary of the sampled space conv(columns of P_tilde),
-    optionally intersected with per-APoI interval bounds, projected onto
-    APoIs (i, j).
+    """Compute the 2-D boundary of the sampled space projected onto APoIs (i, j).
+
+    The region is the convex hull of the columns of `P_tilde`, optionally intersected
+    with `bounds`. Adaptive edge-normal refinement, as in
+    :func:`mga_engine.projection.project_hull`: four axis-aligned seeds, then each
+    hull edge's outward normal is shot once and the point kept when it pushes the
+    hull out by more than the relative threshold.
 
     Parameters
     ----------
-    P_tilde        : np.ndarray (m+1, n) — APoI matrix [v'; P] (row 0 = cost)
-    i, j           : APoI indices of the two axes (0 = cost allowed)
-    bounds         : optional list of (apoi_index, lower, upper), None where
-                     unbounded — the loop-1 format from navigate(). None or
-                     empty gives the unrestricted (outer) hull.
-    max_iterations : cap on edge-normal refinement rounds (safety net)
-    min_improvement: relative threshold for accepting a pushed-out point
+    P_tilde : numpy.ndarray
+        Shape ``(m + 1, n)``. APoI matrix ``[v'; P_all]``: row 0 holds the cost of
+        each sample in EUR/yr, rows 1..m the PoI values in GW.
+    i, j : int
+        APoI indices of the two axes. Must differ; index 0 (cost) is allowed.
+    bounds : list of tuple, optional
+        Entries ``(apoi_index, lower, upper)`` with ``None`` on an unbounded side,
+        the ``loop1_bounds`` format of :func:`mga_engine.navigation.navigate`.
+        ``None`` or empty gives the unrestricted outer hull.
+    max_iterations : int, default 50
+        Cap on refinement rounds, as a safety net rather than a normal stop.
+    min_improvement : float, default 1e-6
+        Relative acceptance threshold for a pushed-out point, applied in scaled
+        coordinates.
 
     Returns
     -------
-    (points, kind) :
-        kind "polygon" — points are CCW hull vertices, shape (k, 2), k >= 3
-        kind "segment" — points are the 2 endpoints (degenerate, 1D region)
-        kind "point"   — points is a single point, shape (1, 2)
+    points : numpy.ndarray
+        Shape ``(k, 2)``, in the ORIGINAL units of axes `i` and `j`: CCW hull
+        vertices for ``"polygon"``, the two endpoints for ``"segment"``, or a single
+        point of shape ``(1, 2)`` for ``"point"``.
+    kind : str
+        ``"polygon"``, ``"segment"`` or ``"point"``; see :func:`_classify`.
+
+    Raises
+    ------
+    ValueError
+        If ``i == j``.
+    RuntimeError
+        If all four seed solves fail, which means `bounds` does not intersect the
+        sampled space at all.
+
+    Notes
+    -----
+    The two axes are internally divided by their span before refinement, because cost
+    in EUR/yr and PoIs in GW differ by roughly nine orders of magnitude and a single
+    relative threshold could not serve both; the result is multiplied back, so
+    callers always see original units. An axis whose span is pure solver noise keeps
+    its magnitude as the scale instead, which leaves the region correctly thin.
+    A failed direction solve is skipped silently and not counted, and a ``QhullError``
+    during refinement ends refinement early and leaves the rest to :func:`_classify`,
+    so a degenerate region returns a ``"segment"`` or ``"point"`` rather than raising.
+    SciPy LPs only: no network, no file access, no prints, and deterministic.
     """
     if i == j:
         raise ValueError("compute_alpha_hull_2d needs two DIFFERENT APoI indices (i != j).")
@@ -188,7 +355,7 @@ def compute_alpha_hull_2d(
         )
 
     # Normalize each axis by its span (the seeds hit each axis's min/max) so
-    # refinement and degeneracy checks are unit-independent — cost (€/yr) and
+    # refinement and degeneracy checks are unit-independent - cost (EUR/yr) and
     # PoIs (GW) differ by ~9 orders of magnitude. An axis whose span is pure
     # solver noise keeps its magnitude as scale, so it stays thin when scaled.
     pts_arr = np.array(points)
@@ -212,7 +379,7 @@ def compute_alpha_hull_2d(
         try:
             hull_pts = _ccw_hull_vertices(np.array(points))
         except QhullError:
-            break  # degenerate region — _classify below handles it
+            break  # degenerate region - _classify below handles it
 
         added_this_round = False
         for w in _outward_edge_normals(hull_pts):

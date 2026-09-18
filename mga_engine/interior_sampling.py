@@ -1,10 +1,10 @@
-"""
-interior_sampling.py — Interior point sampling via MP(r) across decreasing epsilon levels.
+"""Interior sampling of the near-optimal PoI space via MP(r) at tightening epsilon.
 
-We re-run MP(r) at multiple epsilon levels, each tighter than the last.
-Higher epsilon → points near the outer boundary of F^P.
-Lower epsilon  → points closer to x*, deep in the interior.
-Together they give good radial coverage of the whole space.
+Runs the MP(r) sampling of :mod:`mga_engine.vertex_sampling` once per cost-slack
+level, each level tighter than the last: a high epsilon puts points near the outer
+boundary of F^P, a low one keeps them close to the cost optimum x*. Together the
+levels cover the interior radially instead of only its outer hull, which is what the
+CCP surrogate needs to price points away from the boundary.
 """
 
 import numpy as np
@@ -19,13 +19,41 @@ SAMPLES_PER_LEVEL = 10
 
 
 def derive_epsilon_levels(epsilon: float, n_levels: int, epsilon_min: float) -> list:
-    """Derive the interior sampling epsilon levels from the outer epsilon.
+    """Derive the interior-sampling epsilon levels from the outer epsilon.
 
-    Levels descend linearly from epsilon in steps of epsilon / n_levels — the
-    top level is the first step below epsilon (strictly below it) — and the
-    last level is epsilon_min. With epsilon=0.05, n_levels=5, epsilon_min=0.005
-    this reproduces the sequence formerly hardcoded here:
-    [0.04, 0.03, 0.02, 0.01, 0.005].
+    Levels descend linearly from `epsilon` in steps of ``epsilon / n_levels``,
+    starting one step below `epsilon` so that the outer level already covered by the
+    vertex sampling is not repeated, and the last level is replaced by `epsilon_min`.
+    With ``epsilon=0.05, n_levels=5, epsilon_min=0.005`` this reproduces
+    ``EPSILON_LEVELS``, the sequence formerly hardcoded here.
+
+    Parameters
+    ----------
+    epsilon : float
+        Outer relative cost slack. Every level stays strictly below it.
+    n_levels : int
+        Number of levels to return. Must be at least 1.
+    epsilon_min : float
+        Tightest level, returned as the last entry. Must satisfy
+        ``0 < epsilon_min < epsilon``.
+
+    Returns
+    -------
+    list of float
+        Length `n_levels`, rounded to 12 decimals so the values print cleanly.
+
+    Raises
+    ------
+    AssertionError
+        If `n_levels` is below 1, or `epsilon_min` is outside ``(0, epsilon)``.
+        These are plain ``assert`` statements, so they vanish under ``python -O``.
+
+    Notes
+    -----
+    The result is only strictly decreasing when ``epsilon_min < epsilon / n_levels``.
+    ``derive_epsilon_levels(0.05, 5, 0.02)`` gives ``[0.04, 0.03, 0.02, 0.01, 0.02]``,
+    whose last level is looser than the one before it. Nothing here or in the callers
+    rejects that.
     """
     assert n_levels >= 1, f"n_levels must be >= 1, got {n_levels}"
     assert 0 < epsilon_min < epsilon, (
@@ -44,23 +72,46 @@ def sample_interior(
     samples_per_level: int = SAMPLES_PER_LEVEL,
     seed: int = 42,
 ) -> np.ndarray:
-    """
-    Sample interior points by running MP(r) at decreasing epsilon levels.
+    """Sample interior points by running MP(r) once per descending epsilon level.
 
     Parameters
     ----------
-    build_network_fn   : callable that returns a fresh PyPSA network
-    make_poi_specs_fn  : callable that takes a network and returns poi_specs
-    opt_cost           : c'x* from the base solve
-    epsilon_levels     : list of epsilon values to sweep through (typically
-                         from derive_epsilon_levels)
-    samples_per_level  : number of MP(r) solves per epsilon level
-    seed               : caller seed; one independent child seed per epsilon
-                         level is derived from it via SeedSequence.spawn()
+    build_network_fn : callable
+        ``build_network_fn() -> pypsa.Network``. Called once per level; each level
+        needs its own unsolved network because its cost slack differs.
+    make_poi_specs_fn : callable
+        ``make_poi_specs_fn(network) -> list of PoiSpec``. Must return the same PoIs
+        in the same order at every level, since the columns are stacked into one
+        matrix.
+    opt_cost : float
+        Minimum system cost c'x* in EUR/yr from the base solve; see
+        :func:`mga_engine.vertex_sampling._build_mga_model`.
+    epsilon_levels : list of float, optional
+        Relative cost slacks to sweep, normally from :func:`derive_epsilon_levels`.
+        ``None`` falls back to the module constant ``EPSILON_LEVELS``.
+    samples_per_level : int, default 10
+        MP(r) solves per level, i.e. columns contributed by each level.
+    seed : int, default 42
+        Caller seed. One independent child seed per level is derived from it with
+        ``numpy.random.SeedSequence(seed).spawn()``, so the same `seed` reproduces
+        every level's directions and a different `seed` changes all of them at once.
 
     Returns
     -------
-    P_interior : np.ndarray, shape (m, total_samples)
+    numpy.ndarray
+        Shape ``(m, len(epsilon_levels) * samples_per_level)``. The levels' matrices
+        side by side, in level order, with PoI values in GW.
+
+    Raises
+    ------
+    RuntimeError
+        Propagated from the first failed MP(r) solve.
+
+    Notes
+    -----
+    Builds one network and calls HiGHS `samples_per_level` times per level, and
+    prints a line per level plus a total. Nothing checks that the levels actually
+    descend or stay below the outer epsilon.
     """
     if epsilon_levels is None:
         epsilon_levels = EPSILON_LEVELS
@@ -93,69 +144,3 @@ def sample_interior(
     P_interior = np.hstack(all_columns)
     print(f"[interior] Done — {P_interior.shape[1]} interior points total.")
     return P_interior
-
-
-if __name__ == "__main__":
-    import logging, warnings
-    logging.getLogger("linopy").setLevel(logging.WARNING)
-    logging.getLogger("pypsa").setLevel(logging.WARNING)
-    warnings.filterwarnings("ignore", category=UserWarning, module="linopy")
-
-    import matplotlib.pyplot as plt
-    from scipy.spatial import ConvexHull
-    from mga_engine.network import build_network
-    from mga_engine.poi import make_poi_specs, evaluate_all
-    from mga_engine.vertex_sampling import sample_vertices
-
-    # --- base solve ---
-    network = build_network()
-    network.optimize(solver_name="highs", include_objective_constant=False)
-    opt_cost = network.objective
-    poi_specs = make_poi_specs(network)
-    p_star = evaluate_all(poi_specs, network)
-
-    # --- vertices (epsilon=0.05, fresh network) ---
-    network_v = build_network()
-    poi_specs_v = make_poi_specs(network_v)
-    P_vertices = sample_vertices(
-        network_v, poi_specs_v, opt_cost,
-        epsilon=0.05, n_samples=50, seed=42,
-    )
-
-    # --- interior (5 epsilon levels, fresh network per level) ---
-    P_interior = sample_interior(
-        build_network_fn=build_network,
-        make_poi_specs_fn=make_poi_specs,
-        opt_cost=opt_cost,
-    )
-
-    # --- plot ---
-    fig, ax = plt.subplots(figsize=(8, 6))
-
-    hull = ConvexHull(P_vertices.T)
-    for simplex in hull.simplices:
-        ax.plot(P_vertices[0, simplex], P_vertices[1, simplex],
-                "k-", linewidth=1.2, alpha=0.5)
-
-    ax.scatter(P_vertices[0], P_vertices[1],
-               color="steelblue", s=80, zorder=3, label="vertices (ε=5%)")
-
-    # colour interior points by epsilon level so we can see the layering
-    colors = ["#f4a460", "#e07b39", "#c85a1e", "#a03010", "#781800", "#500000"]
-    for i, eps in enumerate(EPSILON_LEVELS):
-        start = i * SAMPLES_PER_LEVEL
-        end = start + SAMPLES_PER_LEVEL
-        ax.scatter(P_interior[0, start:end], P_interior[1, start:end],
-                   color=colors[i], s=30, alpha=0.7, zorder=2, label=f"ε={eps}")
-
-    ax.scatter(p_star[0], p_star[1],
-               color="red", s=150, marker="*", zorder=4, label="optimal x*")
-
-    ax.set_xlabel("solar_cap_gw")
-    ax.set_ylabel("wind_cap_gw")
-    ax.set_title("F^P — vertices + interior samples across epsilon levels")
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("feasible_space_interior.png", dpi=150)
-    plt.show()

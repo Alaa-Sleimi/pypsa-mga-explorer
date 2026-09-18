@@ -1,39 +1,45 @@
-"""
-gp_solver.py — Goal Programming solver GP(p^i) for each sample point.
+"""Goal Programming solves GP(p^i) that price every sampled point.
 
-For each sample point p^i in P_all, solve:
+Third step of the preparation phase: after the sampling modules have collected PoI
+points, each point is priced by re-solving the network with its PoI values pinned,
 
     GP(p^i): min  c'x
-             s.t. Ax ≤ b          (existing network constraints)
-                  Dx = p^i        (dual: γ^i  — pins PoI values)
+             s.t. Ax <= b          (existing network constraints)
+                  Dx = p^i         (dual: gamma^i — pins the PoI values)
 
-Outputs:
-    v         : (n,)      minimum cost achievable at each p^i
-    Gamma     : (m, n)    dual variables for the PoI equality constraints
-    solutions : list of dicts, one per sample — full time-varying arrays
+which yields the cost ``v``, the PoI duals ``Gamma`` and the full solution per sample
+that :mod:`mga_engine.preparation_state` stores and the exploration phase reads.
 """
 
-import logging
-import warnings
 import numpy as np
 import pypsa
 from typing import List, Tuple
-from mga_engine.network import build_network
-from mga_engine.poi import PoiSpec, make_poi_specs
+from mga_engine.poi import PoiSpec
 
 
 def _extract_solution(network) -> dict:
-    """
-    Generically extract decision variables from a solved PyPSA network.
-    
-    - Static (planning): only columns ending in '_opt' e.g. p_nom_opt, s_nom_opt
-    - Dynamic (operational): everything PyPSA populated after solving e.g. Generator_p
-    
-    Returns a dict like:
-        {"Generator_p_nom_opt": array(n_generators,),
-         "Generator_p": array(n_snapshots, n_generators),
-         "Line_s_nom_opt": array(n_lines,),
-         "Line_p0": array(n_snapshots, n_lines), ...}
+    """Collect a solved network's variable frames into flat NumPy arrays.
+
+    Parameters
+    ----------
+    network : pypsa.Network
+        Network that has been solved and had its solution assigned.
+
+    Returns
+    -------
+    dict
+        Maps ``"<Component>_<attribute>"`` to a copy of that frame's values, e.g.
+        ``"Generator_p_nom_opt"`` of shape ``(n_generators,)``, ``"Generator_p"`` of
+        shape ``(n_snapshots, n_generators)``, ``"Line_s_nom_opt"``, ``"Line_p0"``.
+
+    Notes
+    -----
+    Static frames contribute only columns ending in ``_opt`` that hold at least one
+    non-NaN value. Dynamic frames contribute EVERY non-empty time-varying frame, so
+    the dict also carries inputs such as ``Generator_p_max_pu`` and ``Load_p_set``,
+    not just results; those inputs are identical across samples but are stored per
+    sample by :func:`mga_engine.preparation_state.save`, which inflates the file.
+    Values are copied, so the result never aliases the network's frames.
     """
     solution = {}
 
@@ -58,14 +64,42 @@ def _solve_single_gp(
     poi_specs: List[PoiSpec],
     p_i: np.ndarray,
 ) -> Tuple[float, np.ndarray, dict]:
-    """
-    Solve GP(p^i) for a single sample point.
+    """Solve GP(p^i) for one sample point, with every PoI pinned to ``p_i``.
+
+    Parameters
+    ----------
+    network : pypsa.Network
+        Network to build the model on. A fresh linopy model is created here, so one
+        network object can serve every sample point.
+    poi_specs : list of PoiSpec
+        PoI specs, in the same order as the entries of `p_i`.
+    p_i : numpy.ndarray
+        Shape ``(m,)``. Target value of each PoI, in that PoI's unit (GW).
 
     Returns
     -------
-    v_i      : float  — minimum cost at p^i
-    gamma_i  : (m,)   — duals for PoI equality constraints
-    solution : dict   — full time-varying solution arrays
+    v_i : float
+        Minimum objective value attainable at `p_i`.
+    gamma_i : numpy.ndarray
+        Shape ``(m,)``. Dual of each ``poi_fix_<j>`` equality constraint.
+    solution : dict
+        Full solution arrays, as returned by :func:`_extract_solution`.
+
+    Raises
+    ------
+    RuntimeError
+        If the solver status is not ``"ok"``.
+
+    Notes
+    -----
+    Calls HiGHS. Mutates `network`: replaces ``network.model`` and writes the
+    solution into its result columns. The objective excludes PyPSA's objective
+    constant, matching the cost the rest of the pipeline compares against.
+
+    Sign convention: ``gamma_i`` is un-negated, i.e. d(cost)/d(p_i) in EUR/yr per GW,
+    so a positive value means that raising that PoI's target raises the minimum
+    system cost and a negative value means it lowers it. Verified for the pinned
+    linopy/highspy versions on the HiGHS minimisation path.
     """
     network.optimize.create_model(include_objective_constant=False)
     m = network.model
@@ -97,32 +131,40 @@ def _solve_single_gp(
 
 def solve_all_gp(
     P_all: np.ndarray,
-    build_network_fn=None,
-    make_poi_specs_fn=None,
+    build_network_fn,
+    make_poi_specs_fn,
 ) -> Tuple[np.ndarray, np.ndarray, list]:
-    """
-    Solve GP(p^i) for all n sample points.
+    """Solve GP(p^i) for every sampled point and return costs, duals and solutions.
 
     Parameters
     ----------
-    P_all             : (m, n) sample matrix
-    build_network_fn  : callable returning a fresh network. Defaults to the
-                        example build_network, so existing callers are unchanged;
-                        pass your own to run GP on a different network.
-    make_poi_specs_fn : callable taking a network -> list[PoiSpec]. Defaults to
-                        make_poi_specs with the default PoI definitions.
+    P_all : numpy.ndarray
+        Shape ``(m, n)``. Sample matrix; each column is one PoI target point.
+    build_network_fn : callable
+        ``build_network_fn() -> pypsa.Network``. Called once; every sample is then
+        solved on that one network, with a fresh model per sample.
+    make_poi_specs_fn : callable
+        ``make_poi_specs_fn(network) -> list of PoiSpec``, in `P_all` row order.
 
     Returns
     -------
-    v         : (n,)      minimum cost per sample
-    Gamma     : (m, n)    dual variables per sample
-    solutions : list of dicts, one per sample — full time-varying arrays
-    """
-    if build_network_fn is None:
-        build_network_fn = build_network
-    if make_poi_specs_fn is None:
-        make_poi_specs_fn = make_poi_specs
+    v : numpy.ndarray
+        Shape ``(n,)``. Minimum cost at each sample.
+    Gamma : numpy.ndarray
+        Shape ``(m, n)``. Column ``i`` holds the PoI duals at sample ``i``.
+    solutions : list of dict
+        One :func:`_extract_solution` dict per sample, in column order.
 
+    Raises
+    ------
+    RuntimeError
+        Propagated from the first failed GP solve; no partial result is returned.
+
+    Notes
+    -----
+    Both callables are required; there is no default network or PoI definition.
+    Calls HiGHS once per sample and prints a line per sample plus a cost range.
+    """
     m_dim, n = P_all.shape
 
     network_gp = build_network_fn()
@@ -142,53 +184,3 @@ def solve_all_gp(
 
     print(f"[gp] Done. Cost range: {v.min():,.0f} — {v.max():,.0f}")
     return v, Gamma, solutions
-
-
-if __name__ == "__main__":
-    logging.getLogger("linopy").setLevel(logging.WARNING)
-    logging.getLogger("pypsa").setLevel(logging.WARNING)
-    warnings.filterwarnings("ignore", category=UserWarning, module="linopy")
-
-    from mga_engine.network import build_network
-    from mga_engine.poi import make_poi_specs, evaluate_all
-    from mga_engine.vertex_sampling import sample_vertices
-    from mga_engine.interior_sampling import sample_interior, EPSILON_LEVELS, SAMPLES_PER_LEVEL
-
-    # --- base solve ---
-    network = build_network()
-    network.optimize(solver_name="highs", include_objective_constant=False,
-                     solver_options={"output_flag": False})
-    opt_cost = network.objective
-    poi_specs = make_poi_specs(network)
-    p_star = evaluate_all(poi_specs, network)
-
-    # --- vertices ---
-    network_v = build_network()
-    poi_specs_v = make_poi_specs(network_v)
-    P_vertices = sample_vertices(
-        network_v, poi_specs_v, opt_cost,
-        epsilon=0.05, n_samples=20, seed=42,
-    )
-
-    # --- interior ---
-    P_interior = sample_interior(
-        build_network_fn=build_network,
-        make_poi_specs_fn=make_poi_specs,
-        opt_cost=opt_cost,
-    )
-
-    # --- combine ---
-    P_all = np.hstack([P_vertices, P_interior])
-    print(f"[main] P_all shape: {P_all.shape}  ({P_all.shape[1]} total sample points)")
-
-    # --- GP phase ---
-    v, Gamma, solutions = solve_all_gp(P_all)
-
-    # --- sanity checks ---
-    print(f"\n[main] v shape     : {v.shape}")
-    print(f"[main] Gamma shape : {Gamma.shape}")
-    print(f"[main] solutions   : {len(solutions)} dicts")
-    print(f"[main] keys in first solution: {list(solutions[0].keys())}")
-    print(f"[main] opt_cost    : {opt_cost:,.0f}")
-    print(f"[main] min v       : {v.min():,.0f}  (should be >= opt_cost)")
-    print(f"[main] max v       : {v.max():,.0f}  (should be <= (1+ε)*opt_cost)")
