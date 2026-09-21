@@ -1,4 +1,4 @@
-# EEM_Sina
+# pypsa-mga-explorer
 
 An implementation of Sina Hajikazemi's MGA-Compass method for interactive
 near-optimal solution exploration on PyPSA energy system models: instead of a
