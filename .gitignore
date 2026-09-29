@@ -15,3 +15,4 @@ data/*
 CODE_REVIEW.md
 figures/
 traverse_cost_path.png
+.vscode/

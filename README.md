@@ -42,8 +42,8 @@ than this one for the full list.
 **Linux / macOS**
 
 ```bash
-git clone git@git.rwth-aachen.de:Sina.Hajikazemi/pypsa-mga.git
-cd pypsa-mga
+git clone https://github.com/Alaa-Sleimi/pypsa-mga-explorer.git
+cd pypsa-mga-explorer
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -52,8 +52,8 @@ pip install -r requirements.txt
 **Windows (PowerShell)**
 
 ```powershell
-git clone git@git.rwth-aachen.de:Sina.Hajikazemi/pypsa-mga.git
-cd pypsa-mga
+git clone https://github.com/Alaa-Sleimi/pypsa-mga-explorer.git
+cd pypsa-mga-explorer
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -74,7 +74,7 @@ directory) and run its cells in order. For a full walkthrough on the built-in
 | `mga_exploration.ipynb` | The reference notebook: the only intended way to run the pipeline end to end. |
 | `tests/` | Automated tests plus a few standalone check scripts; see "Running the tests" below. |
 | `docs/` | Reference documentation for settings, the API, the pipeline, and the toy-network walkthrough. |
-| `data/` | Preparation-state caches and other generated `.nc`/`.npz` files; not committed (see `.gitignore`). |
+| `data/` | Preparation-state caches and other generated `.nc`/`.npz` files, written here by the notebook at runtime. The folder is kept in Git via `.gitkeep`; its contents are not committed (see `.gitignore`). |
 | `figures/` | PNGs exported by the notebook's figure-export cell; not committed. |
 
 ## Documentation
