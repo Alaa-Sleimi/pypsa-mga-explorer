@@ -115,3 +115,7 @@ to avoid that.
 
 - Hajikazemi, S. *Interactive Exploration of Near-Optimal Solutions of Energy
   Planning Models*. EEM 2026.
+
+## License
+
+Released under the MIT License. See `LICENSE` for details.
